@@ -1678,36 +1678,51 @@ elif page == "📝 Resultados en Vivo":
     
     real_res = load_real_results()
     
-    with st.form("add_result_form"):
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
-        team_h = c1.selectbox("Local", options=QUALIFIED_TEAMS, key="res_h")
-        g_h = c2.number_input("Goles Local", min_value=0, max_value=15, value=0)
-        g_a = c3.number_input("Goles Visita", min_value=0, max_value=15, value=0)
-        team_a = c4.selectbox("Visita", options=QUALIFIED_TEAMS, key="res_a", index=1)
+    with st.form("bulk_results_form"):
+        st.markdown("### Partidos de la Fase de Grupos")
+        st.markdown("Deja los campos en blanco para los partidos que aún no se han jugado.")
         
-        submitted = st.form_submit_button("Guardar Resultado Real")
+        new_res = {}
+        
+        for grp_name, teams in sorted(WC2026_GROUPS.items()):
+            with st.expander(f"Grupo {grp_name[-1]}"):
+                for i in range(len(teams)):
+                    for j in range(i+1, len(teams)):
+                        t1, t2 = teams[i], teams[j]
+                        key = f"{t1}|{t2}"
+                        
+                        # Recuperar valores existentes (incluso si estaban invertidos antes)
+                        existing_gh = None
+                        existing_ga = None
+                        if key in real_res:
+                            existing_gh = real_res[key]["g_h"]
+                            existing_ga = real_res[key]["g_a"]
+                        elif f"{t2}|{t1}" in real_res:
+                            existing_gh = real_res[f"{t2}|{t1}"]["g_a"]
+                            existing_ga = real_res[f"{t2}|{t1}"]["g_h"]
+                        
+                        col1, col2, col3, col4 = st.columns([3, 2, 2, 3])
+                        col1.markdown(f"<div style='text-align:right; margin-top:8px;'><b>{t1}</b></div>", unsafe_allow_html=True)
+                        g_h_input = col2.number_input("Local", min_value=0, max_value=20, value=existing_gh, key=f"h_{key}", label_visibility="collapsed")
+                        g_a_input = col3.number_input("Visita", min_value=0, max_value=20, value=existing_ga, key=f"a_{key}", label_visibility="collapsed")
+                        col4.markdown(f"<div style='margin-top:8px;'><b>{t2}</b></div>", unsafe_allow_html=True)
+                        
+                        new_res[key] = (t1, t2, g_h_input, g_a_input)
+                        
+        submitted = st.form_submit_button("Guardar y Recalcular Simulación")
         if submitted:
-            if team_h == team_a:
-                st.error("Un equipo no puede jugar contra sí mismo.")
-            else:
-                key = f"{team_h}|{team_a}"
-                real_res[key] = {"g_h": g_h, "g_a": g_a}
-                save_real_results(real_res)
-                st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
-                st.rerun()
-                
-    if real_res:
-        st.markdown("### Resultados Guardados")
-        for k, v in list(real_res.items()):
-            if "|" not in k: continue
-            parts = k.split("|")
-            if len(parts) != 2: continue
-            t1, t2 = parts[0], parts[1]
-            col1, col2 = st.columns([8, 1])
-            col1.markdown(f"**{t1}** {v.get('g_h', 0)} - {v.get('g_a', 0)} **{t2}**")
-            if col2.button("🗑️", key=f"del_{k}"):
-                del real_res[k]
-                save_real_results(real_res)
+            updated_res = {}
+            has_error = False
+            for k, (t1, t2, val_h, val_a) in new_res.items():
+                if val_h is not None and val_a is not None:
+                    updated_res[k] = {"g_h": int(val_h), "g_a": int(val_a)}
+                elif val_h is not None or val_a is not None:
+                    has_error = True
+                    st.error(f"Partido incompleto: {t1} vs {t2}. Llena ambos goles o deja ambos en blanco.")
+            
+            if not has_error:
+                save_real_results(updated_res)
+                st.success("Resultados guardados y aplicados correctamente.")
                 st.rerun()
 
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
