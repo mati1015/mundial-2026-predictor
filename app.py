@@ -1305,7 +1305,7 @@ if page == "🌐 Grupos":
         <span style="font-size:1.2rem;">{flag}</span>
         <span style="font-size:0.87rem; color:#e6edf3; font-weight:500;">{t}{host_tag}</span>
     </div>
-    <span style="font-size:0.75rem; color:#58a6ff; font-family:'JetBrains Mono',monospace;">{elo}</span>
+    <span style="font-size:0.75rem; color:#58a6ff; font-family:'JetBrains Mono',monospace;">{int(elo)}</span>
 </div>
 """
 
@@ -1693,6 +1693,28 @@ elif page == "📝 Resultados en Vivo":
                 save_real_results(real_res)
                 st.cache_data.clear()
                 st.rerun()
+
+    st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
+    st.markdown("### 🏆 Proyección Actualizada")
+    with st.spinner("⚡ Recalculando 100,000 simulaciones con los resultados reales..."):
+        results_df, top_scorers_df = get_simulation_results()
+        
+    st.dataframe(
+        results_df,
+        column_config={
+            "Team": st.column_config.TextColumn("Selección", width=160),
+            "Group Stage (%)": st.column_config.NumberColumn("16vos", format="%.1f%%"),
+            "Round of 32 (%)": st.column_config.NumberColumn("Octavos", format="%.1f%%"),
+            "Round of 16 (%)": st.column_config.NumberColumn("Cuartos", format="%.1f%%"),
+            "Quarterfinals (%)": st.column_config.NumberColumn("Semis", format="%.1f%%"),
+            "Semifinals (%)": st.column_config.NumberColumn("Final", format="%.1f%%"),
+            "Final (%)": st.column_config.NumberColumn("Campeón", format="%.1f%%"),
+            "Winner (%)": st.column_config.ProgressColumn("Probabilidad Título", format="%.1f%%", min_value=0, max_value=100),
+        },
+        hide_index=True,
+        height=600,
+        use_container_width=True
+    )
 
 
 # ── Footer ───────────────────────────────────────────────────────────────────
