@@ -1685,9 +1685,12 @@ elif page == "📝 Resultados en Vivo":
     if real_res:
         st.markdown("### Resultados Guardados")
         for k, v in list(real_res.items()):
-            t1, t2 = k.split("|")
+            if "|" not in k: continue
+            parts = k.split("|")
+            if len(parts) != 2: continue
+            t1, t2 = parts[0], parts[1]
             col1, col2 = st.columns([8, 1])
-            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
+            col1.markdown(f"**{t1}** {v.get('g_h', 0)} - {v.get('g_a', 0)} **{t2}**")
             if col2.button("🗑️", key=f"del_{k}"):
                 del real_res[k]
                 save_real_results(real_res)
