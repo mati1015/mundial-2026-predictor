@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.graph_objects go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -66,11 +66,9 @@ def get_all_h2h_stats() -> dict:
         h, a = row["home_team"], row["away_team"]
         if pd.isna(h) or pd.isna(a): continue
         
-        # Bug #5: Weighted counting for friendlies
-        is_friendly = False
-        if hasattr(row, 'tournament') and row['tournament'] == 'Friendly':
-            is_friendly = True
-        weight = 0.1 if is_friendly else 1.0
+        # Bug #5: Weighted counting (Friendlies = 0.1)
+        tournament = row.get("tournament", "Official")
+        weight = 0.1 if tournament == "Friendly" else 1.0
         
         if h not in stats: stats[h] = {}
         if a not in stats[h]: stats[h][a] = {"wins": 0.0, "draws": 0.0, "losses": 0.0, "matches": 0.0}
@@ -266,7 +264,7 @@ h1, h2, h3 { color: var(--text-primary) !important; }
 
 /* ── Score badge ── */
 .score-badge {
-    background: linear-gradient(135deg, #1f6feb 0%, #bc8cff) !important;
+    background: linear-gradient(135deg, #1f6feb 0%, #bc8cff 100%);
     border-radius: 12px;
     padding: 3px 12px;
     font-size: 1.05rem;
@@ -529,10 +527,9 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
         teams = group_idxs[g]
         for a_idx, b_idx in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
             h_i, a_i = int(teams[a_idx]), int(teams[b_idx])
-            t_h = QUALIFIED_TEAMS[h_i]
-            t_a = QUALIFIED_TEAMS[a_i]
+            t_h, t_a = QUALIFIED_TEAMS[h_i], QUALIFIED_TEAMS[a_i]
             
-            # Bug #4: Real results injection
+            # Bug #4: Injection of real match results
             k1 = f"{t_h}|{t_a}"
             k2 = f"{t_a}|{t_h}"
             if k1 in real_res:
@@ -544,7 +541,7 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
             else:
                 gh = rng.poisson(xg[h_i, a_i, 0], n).astype(np.int16)
                 ga = rng.poisson(xg[h_i, a_i, 1], n).astype(np.int16)
-            
+
             pts[:, h_i] += np.where(gh > ga, 3, np.where(gh == ga, 1, 0)).astype(np.int16)
             pts[:, a_i] += np.where(ga > gh, 3, np.where(gh == ga, 1, 0)).astype(np.int16)
             gd[:, h_i] += (gh - ga)
@@ -571,12 +568,18 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    # Bug #1 Fix: Bracket logic to ensure no Runner vs Runner in R32
+    # Bug #1 — Fix: R32 bracket must never pair Runner vs Runner
+    # Logic: 12 winners face (8 Thirds + 4 Runners). Remaining 8 Runners face winners? 
+    # To maintain 16 matches (32 teams): 
+    # 12 Winners face 12 opponents (all 8 thirds + 4 runners). 
+    # Remaining 8 runners face each other? No.
+    # To satisfy "Winners (12) vs R or T" and "No R vs R":
+    # 12 Winners face 12 Runners. 8 Thirds face each other (4 matches).
     rand_all_runners = rng.permuted(runners_up, axis=1)
     rand_all_thirds = rng.permuted(best_thirds, axis=1)
-    # Correct structure: 12 Winners face (8 Thirds + 4 Runners). 4 Thirds face 4 Runners.
+    
     r32_h = np.hstack([winners, rand_all_thirds[:, :4]])
-    r32_a = np.hstack([rand_all_thirds[:, 4:8], rand_all_runners])
+    r32_a = np.hstack([rand_all_runners, rand_all_thirds[:, 4:]])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -665,7 +668,8 @@ def calculate_form_multipliers() -> dict:
     try:
         df = pd.read_csv("h2h_results.csv", parse_dates=["date"])
         df = df[df["tournament"] != "Friendly"]
-        # Bug #7: Dynamic cutoff cap at tournament start
+        
+        # Bug #7 — Fix: Dynamic cutoff date capped at tournament start
         TOURNAMENT_START = pd.Timestamp("2026-06-11")
         cutoff = min(pd.Timestamp.today(), TOURNAMENT_START)
         df = df[df["date"] < cutoff]
@@ -973,6 +977,7 @@ def plotly_elo_radar(home: str, away: str, pred: dict) -> go.Figure:
     flag_h = TEAM_FLAGS.get(home, "🏳")
     flag_a = TEAM_FLAGS.get(away, "🏳")
 
+    # Colores sólidos para el borde y colores rgba() para el relleno
     trace_styles = [
         (f"{flag_h} {home}", vals_h, "#3fb950", _hex_to_rgba("#3fb950", 0.15)),
         (f"{flag_a} {away}", vals_a, "#f85149", _hex_to_rgba("#f85149", 0.15)),
@@ -1070,11 +1075,12 @@ with st.sidebar:
 # CARGA DE DATOS (CACHEADA)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Bug #2 — Fix: Added @st.cache_data and real_res as hashable param
 @st.cache_data(show_spinner=False)
 def get_simulation_results(_real_res_hashable: tuple):
+    """Ejecuta la simulación de torneos en cache."""
     idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
-    # Bug #2: Cache invalidation via real_res parameter
     real_res = dict(_real_res_hashable)
     
     xg = _build_elo_xg_matrix()
@@ -1128,9 +1134,7 @@ def get_simulation_results(_real_res_hashable: tuple):
         teams = group_idxs[g]
         for a_local, b_local in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
             h_i, a_i = int(teams[a_local]), int(teams[b_local])
-            
-            t_h = idx_to_team.get(h_i, "Unknown")
-            t_a = idx_to_team.get(a_i, "Unknown")
+            t_h, t_a = QUALIFIED_TEAMS[h_i], QUALIFIED_TEAMS[a_i]
             
             # Bug #4 consistency: pipe as separator
             k1 = f"{t_h}|{t_a}"
@@ -1184,13 +1188,13 @@ def get_simulation_results(_real_res_hashable: tuple):
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    # Bug #1 Fix: Bracket logic to ensure no Runner vs Runner in R32 (16 matches)
+    # Bug #1 — Fix: Correct bracket pairing to prevent illegal matchups
     rand_all_runners = rng.permuted(runners_up, axis=1)
     rand_all_thirds = rng.permuted(best_thirds, axis=1)
-    # Correct structure for 16 matches to satisfy "No R vs R" while following "Winners face R or T"
-    # Matches 0-3: Winner vs Third, 4-11: Winner vs Runner, 12-15: Third vs Runner
+    # 12 Winners face [8 Thirds + 4 Runners]. 8 remaining Runners face Thirds? 
+    # Valid 16-match bracket for R32:
     r32_h = np.hstack([winners, rand_all_thirds[:, :4]])
-    r32_a = np.hstack([rand_all_thirds[:, 4:8], rand_all_runners])
+    r32_a = np.hstack([rand_all_runners, rand_all_thirds[:, 4:]])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -1431,9 +1435,9 @@ elif page == "📊 Simulación Montecarlo":
 
     with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        # Bug #2: Passing hashable results to cached function
-        real_res_data = load_real_results()
-        results_df, top_scorers_df = get_simulation_results(tuple(sorted(real_res_data.items())))
+        # Bug #2 — Fix: Passing hashable results to cached function
+        real_res_current = load_real_results()
+        results_df, top_scorers_df = get_simulation_results(tuple(sorted(real_res_current.items())))
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
@@ -1678,7 +1682,13 @@ elif page == "📝 Resultados en Vivo":
     if real_res:
         st.markdown("### Resultados Guardados")
         for k, v in list(real_res.items()):
-            t1, t2 = k.split("|")
+            # Safe unpack to avoid ValueError on legacy keys
+            parts = k.split("|")
+            if len(parts) == 2:
+                t1, t2 = parts
+            else:
+                t1, t2 = k, "N/A"
+                
             col1, col2 = st.columns([8, 1])
             col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
             if col2.button("🗑️", key=f"del_{k}"):
@@ -1690,7 +1700,7 @@ elif page == "📝 Resultados en Vivo":
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🏆 Proyección Actualizada")
     with st.spinner("⚡ Recalculando 100,000 simulaciones con los resultados reales..."):
-        # Bug #2: Passing hashable results to cached function
+        # Bug #2 — Fix: Passing hashable sorted items
         results_df, top_scorers_df = get_simulation_results(tuple(sorted(real_res.items())))
         
     st.dataframe(
