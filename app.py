@@ -15,6 +15,8 @@ import warnings
 import os
 import time
 import sys
+import threading
+import datetime
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -32,6 +34,7 @@ from scipy.optimize import minimize_scalar
 import json
 
 REAL_RESULTS_FILE = "real_results.json"
+_RESULTS_LOCK = threading.Lock()
 
 def load_real_results() -> dict:
     if os.path.exists(REAL_RESULTS_FILE):
@@ -43,8 +46,9 @@ def load_real_results() -> dict:
     return {}
 
 def save_real_results(res: dict):
-    with open(REAL_RESULTS_FILE, "w") as f:
-        json.dump(res, f)
+    with _RESULTS_LOCK:
+        with open(REAL_RESULTS_FILE, "w") as f:
+            json.dump(res, f, indent=2)
 
 @st.cache_data(show_spinner=False)
 def load_h2h_data():
@@ -61,22 +65,29 @@ def get_all_h2h_stats() -> dict:
     for _, row in df.iterrows():
         h, a = row["home_team"], row["away_team"]
         if pd.isna(h) or pd.isna(a): continue
-        if h not in stats: stats[h] = {}
-        if a not in stats[h]: stats[h][a] = {"wins": 0, "draws": 0, "losses": 0, "matches": 0}
-        if a not in stats: stats[a] = {}
-        if h not in stats[a]: stats[a][h] = {"wins": 0, "draws": 0, "losses": 0, "matches": 0}
         
-        stats[h][a]["matches"] += 1
-        stats[a][h]["matches"] += 1
+        # Bug #5: Weighted counting for friendlies
+        is_friendly = False
+        if hasattr(row, 'tournament') and row['tournament'] == 'Friendly':
+            is_friendly = True
+        weight = 0.1 if is_friendly else 1.0
+        
+        if h not in stats: stats[h] = {}
+        if a not in stats[h]: stats[h][a] = {"wins": 0.0, "draws": 0.0, "losses": 0.0, "matches": 0.0}
+        if a not in stats: stats[a] = {}
+        if h not in stats[a]: stats[a][h] = {"wins": 0.0, "draws": 0.0, "losses": 0.0, "matches": 0.0}
+        
+        stats[h][a]["matches"] += weight
+        stats[a][h]["matches"] += weight
         if row["home_score"] > row["away_score"]:
-            stats[h][a]["wins"] += 1
-            stats[a][h]["losses"] += 1
+            stats[h][a]["wins"] += weight
+            stats[a][h]["losses"] += weight
         elif row["home_score"] < row["away_score"]:
-            stats[h][a]["losses"] += 1
-            stats[a][h]["wins"] += 1
+            stats[h][a]["losses"] += weight
+            stats[a][h]["wins"] += weight
         else:
-            stats[h][a]["draws"] += 1
-            stats[a][h]["draws"] += 1
+            stats[h][a]["draws"] += weight
+            stats[a][h]["draws"] += weight
     return stats
 
 def get_h2h_multiplier(home: str, away: str, h2h_dict: dict) -> tuple[float, float]:
@@ -255,7 +266,7 @@ h1, h2, h3 { color: var(--text-primary) !important; }
 
 /* ── Score badge ── */
 .score-badge {
-    background: linear-gradient(135deg, #1f6feb 0%, #bc8cff 100%);
+    background: linear-gradient(135deg, #1f6feb 0%, #bc8cff) !important;
     border-radius: 12px;
     padding: 3px 12px;
     font-size: 1.05rem;
@@ -396,28 +407,6 @@ except Exception as e:
     pass
 
 
-@st.cache_resource(show_spinner=False)
-def build_ensemble_engine():
-    """
-    Construye el motor Ensemble + Montecarlo y cachea los resultados.
-    Usa datos internos si los modelos reales (Dixon-Coles/Bayesiano) no están ajustados.
-    """
-    try:
-        sys.path.insert(0, ".")
-        from ensemble_simulator import FeatureEngineer, EnsembleModel, VectorizedTournamentSimulator
-
-        engineer = FeatureEngineer()
-        training_data = engineer.load_and_merge()
-        model = EnsembleModel()
-        model.train(training_data)
-        xg_matrix = model.precompute_xg_matrix()
-        simulator = VectorizedTournamentSimulator(xg_matrix, n_simulations=100_000)
-        results_df = simulator.simulate()
-        return xg_matrix, results_df
-    except Exception:
-        return _build_elo_xg_matrix(), _run_fast_simulation()
-
-
 @st.cache_data(show_spinner=False)
 def load_sqi_data_v3() -> dict:
     try:
@@ -538,10 +527,24 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
 
     for g in range(12):
         teams = group_idxs[g]
-        for a, b in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
-            h_i, a_i = int(teams[a]), int(teams[b])
-            gh = rng.poisson(xg[h_i, a_i, 0], n).astype(np.int16)
-            ga = rng.poisson(xg[h_i, a_i, 1], n).astype(np.int16)
+        for a_idx, b_idx in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
+            h_i, a_i = int(teams[a_idx]), int(teams[b_idx])
+            t_h = QUALIFIED_TEAMS[h_i]
+            t_a = QUALIFIED_TEAMS[a_i]
+            
+            # Bug #4: Real results injection
+            k1 = f"{t_h}|{t_a}"
+            k2 = f"{t_a}|{t_h}"
+            if k1 in real_res:
+                gh = np.full(n, real_res[k1]["g_h"], dtype=np.int16)
+                ga = np.full(n, real_res[k1]["g_a"], dtype=np.int16)
+            elif k2 in real_res:
+                gh = np.full(n, real_res[k2]["g_a"], dtype=np.int16)
+                ga = np.full(n, real_res[k2]["g_h"], dtype=np.int16)
+            else:
+                gh = rng.poisson(xg[h_i, a_i, 0], n).astype(np.int16)
+                ga = rng.poisson(xg[h_i, a_i, 1], n).astype(np.int16)
+            
             pts[:, h_i] += np.where(gh > ga, 3, np.where(gh == ga, 1, 0)).astype(np.int16)
             pts[:, a_i] += np.where(ga > gh, 3, np.where(gh == ga, 1, 0)).astype(np.int16)
             gd[:, h_i] += (gh - ga)
@@ -568,16 +571,12 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    # R32
-    # Bug 5: Randomización del bracket para evitar sesgo estructural en el Montecarlo
-    # Los 8 mejores terceros se permutan aleatoriamente contra los 8 campeones de grupo.
-    # Así simulamos la incerteza de la tabla de 495 combinaciones de la FIFA.
-    rand_thirds = rng.permuted(best_thirds, axis=1)
-    rand_runners_1 = rng.permuted(runners_up[:, 0:4], axis=1)
-    rand_runners_2 = rng.permuted(runners_up[:, 8:12], axis=1)
-    
-    r32_h = np.hstack([winners[:, 0:8], winners[:, 8:12], runners_up[:, 4:8]])
-    r32_a = np.hstack([rand_thirds, rand_runners_1, rand_runners_2])
+    # Bug #1 Fix: Bracket logic to ensure no Runner vs Runner in R32
+    rand_all_runners = rng.permuted(runners_up, axis=1)
+    rand_all_thirds = rng.permuted(best_thirds, axis=1)
+    # Correct structure: 12 Winners face (8 Thirds + 4 Runners). 4 Thirds face 4 Runners.
+    r32_h = np.hstack([winners, rand_all_thirds[:, :4]])
+    r32_a = np.hstack([rand_all_thirds[:, 4:8], rand_all_runners])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -666,7 +665,11 @@ def calculate_form_multipliers() -> dict:
     try:
         df = pd.read_csv("h2h_results.csv", parse_dates=["date"])
         df = df[df["tournament"] != "Friendly"]
-        df = df[df["date"] < "2026-06-01"]
+        # Bug #7: Dynamic cutoff cap at tournament start
+        TOURNAMENT_START = pd.Timestamp("2026-06-11")
+        cutoff = min(pd.Timestamp.today(), TOURNAMENT_START)
+        df = df[df["date"] < cutoff]
+        
         form_mults = {}
         for team in QUALIFIED_TEAMS:
             team_df = df[(df["home_team"] == team) | (df["away_team"] == team)].sort_values("date", ascending=False).head(12)
@@ -943,10 +946,6 @@ def plotly_survival_funnel(results_df: pd.DataFrame, team: str) -> go.Figure:
 def _hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
     """
     Convierte un color hexadecimal a formato rgba() compatible con Plotly.
-
-    Plotly NO acepta colores hex de 8 dígitos (#RRGGBBAA, estándar CSS4).
-    Únicamente acepta: #RRGGBB, rgb(), rgba(), hsl(), hsla(), o nombre CSS.
-    Esta función convierte '#3fb950' → 'rgba(63,185,80,0.15)'.
     """
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -974,8 +973,6 @@ def plotly_elo_radar(home: str, away: str, pred: dict) -> go.Figure:
     flag_h = TEAM_FLAGS.get(home, "🏳")
     flag_a = TEAM_FLAGS.get(away, "🏳")
 
-    # Colores sólidos para el borde y colores rgba() para el relleno
-    # ✅ rgba() es el único formato que Plotly acepta para fillcolor transparente
     trace_styles = [
         (f"{flag_h} {home}", vals_h, "#3fb950", _hex_to_rgba("#3fb950", 0.15)),
         (f"{flag_a} {away}", vals_a, "#f85149", _hex_to_rgba("#f85149", 0.15)),
@@ -989,7 +986,7 @@ def plotly_elo_radar(home: str, away: str, pred: dict) -> go.Figure:
             fill="toself",
             name=label,
             line=dict(color=line_color, width=2),
-            fillcolor=fill_color,   # ✅ 'rgba(63,185,80,0.15)' — formato válido
+            fillcolor=fill_color,
         ))
 
     fig.update_layout(
@@ -1044,7 +1041,7 @@ with st.sidebar:
 
     rho_info = estimate_rho_from_data()
     ps_info = get_penalty_skill()
-    rho_label = f"ρ = {rho_info['rho']:.3f} {'(fallback)' if rho_info['fallback'] else f'N={rho_info["N"]}'}"
+    rho_label = f"ρ = {rho_info['rho']:.3f} {'(fallback)' if rho_info['fallback'] else f'N={rho_info['N']}'}"
     ps_label = f"{'Datos reales' if len(ps_info) > 1 else 'Modelo 50/50'}"
     form_label = "Activo ✓"
 
@@ -1074,14 +1071,13 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def get_simulation_results():
+def get_simulation_results(_real_res_hashable: tuple):
     idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
-    # CACHE BUSTER: 2026-06-12
-    """Ejecuta la simulación de torneos en cache."""
+    # Bug #2: Cache invalidation via real_res parameter
+    real_res = dict(_real_res_hashable)
+    
     xg = _build_elo_xg_matrix()
-
-    real_res = load_real_results()
     logistics = load_logistics_data()
     team_last_day = {t: 0 for t in QUALIFIED_TEAMS}
     team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
@@ -1104,8 +1100,6 @@ def get_simulation_results():
             player_weights_mat[i, 0] = 1.0
 
     total_player_goals = np.zeros((N_TEAMS, 23), dtype=np.int32)
-
-
 
     # Build group structure from WC2026_GROUPS
     team_order = []
@@ -1137,6 +1131,8 @@ def get_simulation_results():
             
             t_h = idx_to_team.get(h_i, "Unknown")
             t_a = idx_to_team.get(a_i, "Unknown")
+            
+            # Bug #4 consistency: pipe as separator
             k1 = f"{t_h}|{t_a}"
             k2 = f"{t_a}|{t_h}"
             
@@ -1150,7 +1146,7 @@ def get_simulation_results():
                 lh = float(xg[h_i, a_i, 0])
                 la = float(xg[h_i, a_i, 1])
                 
-                # Generación granular por jugador (Fase 4)
+                # Generación granular por jugador
                 lh_players = lh * player_weights_mat[h_i]
                 la_players = la * player_weights_mat[a_i]
                 
@@ -1188,15 +1184,13 @@ def get_simulation_results():
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    # Bug 5: Randomización del bracket para evitar sesgo estructural en el Montecarlo
-    # Los 8 mejores terceros se permutan aleatoriamente contra los 8 campeones de grupo.
-    # Así simulamos la incerteza de la tabla de 495 combinaciones de la FIFA.
-    rand_thirds = rng.permuted(best_thirds, axis=1)
-    rand_runners_1 = rng.permuted(runners_up[:, 0:4], axis=1)
-    rand_runners_2 = rng.permuted(runners_up[:, 8:12], axis=1)
-    
-    r32_h = np.hstack([winners[:, 0:8], winners[:, 8:12], runners_up[:, 4:8]])
-    r32_a = np.hstack([rand_thirds, rand_runners_1, rand_runners_2])
+    # Bug #1 Fix: Bracket logic to ensure no Runner vs Runner in R32 (16 matches)
+    rand_all_runners = rng.permuted(runners_up, axis=1)
+    rand_all_thirds = rng.permuted(best_thirds, axis=1)
+    # Correct structure for 16 matches to satisfy "No R vs R" while following "Winners face R or T"
+    # Matches 0-3: Winner vs Third, 4-11: Winner vs Runner, 12-15: Third vs Runner
+    r32_h = np.hstack([winners, rand_all_thirds[:, :4]])
+    r32_a = np.hstack([rand_all_thirds[:, 4:8], rand_all_runners])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -1437,7 +1431,9 @@ elif page == "📊 Simulación Montecarlo":
 
     with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        results_df, top_scorers_df = get_simulation_results()
+        # Bug #2: Passing hashable results to cached function
+        real_res_data = load_real_results()
+        results_df, top_scorers_df = get_simulation_results(tuple(sorted(real_res_data.items())))
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
@@ -1514,11 +1510,6 @@ elif page == "📊 Simulación Montecarlo":
         mime="text/csv",
     )
 
-
-# ════════════════════════════════════════════════════════
-# PÁGINA 4: RANKING GLOBAL
-# ════════════════════════════════════════════════════════
-
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🥇 Predicción de Goleadores (Botín de Oro / MVP)")
     st.markdown("Generado simulando individualmente las acciones de cada uno de los 1100 jugadores en los 6.4 millones de partidos del Montecarlo.")
@@ -1545,7 +1536,9 @@ elif page == "📊 Simulación Montecarlo":
         st.info("Datos de jugadores no disponibles.")
 
 
-
+# ════════════════════════════════════════════════════════
+# PÁGINA 4: RANKING GLOBAL
+# ════════════════════════════════════════════════════════
 elif page == "🏅 Ranking Global":
     st.markdown("## Power Ranking · 48 Selecciones")
     st.markdown('<p style="color:#8b949e; font-size:0.85rem; margin-top:-10px; margin-bottom:24px;">Ranking basado en Elo FIFA 2026. El Índice de Poder combina ataque y defensa.</p>', unsafe_allow_html=True)
@@ -1697,7 +1690,8 @@ elif page == "📝 Resultados en Vivo":
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🏆 Proyección Actualizada")
     with st.spinner("⚡ Recalculando 100,000 simulaciones con los resultados reales..."):
-        results_df, top_scorers_df = get_simulation_results()
+        # Bug #2: Passing hashable results to cached function
+        results_df, top_scorers_df = get_simulation_results(tuple(sorted(real_res.items())))
         
     st.dataframe(
         results_df,
