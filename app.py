@@ -382,18 +382,7 @@ _BASE_ELO: dict[str, float] = {
 
 import pandas as pd
 
-# Inyectar el Squad Quality Index (Nivel Micro) extraído de FBref si el archivo existe
-try:
-    if os.path.exists("fbref_sqi.csv"):
-        sqi_df = pd.read_csv("fbref_sqi.csv").set_index("Team")
-        for team in _BASE_ELO:
-            if team in sqi_df.index:
-                # El SQI es un multiplicador (ej. 1.05 = 5% más de calidad de plantilla sobre el promedio)
-                # Fórmula Híbrida: 60% Elo Histórico + 40% Nivel de Jugadores Actuales (SQI)
-                sqi_factor = sqi_df.loc[team, "SQI"]
-                _BASE_ELO[team] = (_BASE_ELO[team] * 0.60) + ((_BASE_ELO[team] * sqi_factor) * 0.40)
-except Exception as e:
-    pass
+
 
 
 @st.cache_resource(show_spinner=False)
@@ -506,7 +495,12 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     player_weights_mat = np.zeros((N_TEAMS, 23), dtype=np.float32)
     for i, t in enumerate(TEAM_ORDER_LIST):
         if t in pw_weights:
-            player_weights_mat[i] = pw_weights[t]
+            w = np.array(pw_weights[t], dtype=np.float32)
+            w_sum = w.sum()
+            if w_sum > 0:
+                player_weights_mat[i] = w / w_sum  # normalizar a suma=1
+            else:
+                player_weights_mat[i, 0] = 1.0
         else:
             player_weights_mat[i, 0] = 1.0
 
@@ -641,6 +635,8 @@ def estimate_rho_from_data() -> dict:
             xg_h[i] = xh
             xg_a[i] = xa
             
+        from scipy.stats import poisson as sp_poisson
+        
         def neg_log_likelihood(rho):
             tau = np.ones(N)
             idx_00 = (h_scores == 0) & (a_scores == 0)
@@ -654,7 +650,13 @@ def estimate_rho_from_data() -> dict:
             tau[idx_11] = 1 - rho
             
             if np.any(tau <= 0): return 1e9
-            return -np.sum(np.log(tau))
+            
+            # Términos de Poisson (constantes respecto a rho pero necesarios para 
+            # que el optimizador encuentre el mínimo global correcto)
+            log_pois_h = sp_poisson.logpmf(h_scores.astype(int), np.maximum(xg_h, 1e-9))
+            log_pois_a = sp_poisson.logpmf(a_scores.astype(int), np.maximum(xg_a, 1e-9))
+            
+            return -(np.sum(np.log(tau)) + np.sum(log_pois_h) + np.sum(log_pois_a))
             
         res = minimize_scalar(neg_log_likelihood, bounds=(-0.25, 0.0), method='bounded')
         return {"rho": res.x if res.success else -0.12, "N": N, "fallback": not res.success}
@@ -1073,12 +1075,51 @@ with st.sidebar:
 # CARGA DE DATOS (CACHEADA)
 # ══════════════════════════════════════════════════════════════════════════════
 
+import hashlib
+import json
+
+def _get_results_cache_key() -> str:
+    rr = load_real_results()
+    return hashlib.md5(json.dumps(rr, sort_keys=True).encode()).hexdigest()
+
 @st.cache_data(show_spinner=False)
-def get_simulation_results():
+def get_simulation_results(_cache_key: str = ""):
     idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
     # CACHE BUSTER: 2026-06-12
     """Ejecuta la simulación de torneos en cache."""
+    rho = estimate_rho_from_data()["rho"]
+    
+    def apply_dc_correction_vectorized(gh, ga, lh, la, rho, rng):
+        """Aplica corrección Dixon-Coles via rejection sampling vectorizado."""
+        mask_00 = (gh == 0) & (ga == 0)
+        mask_10 = (gh == 1) & (ga == 0)
+        mask_01 = (gh == 0) & (ga == 1)
+        mask_11 = (gh == 1) & (ga == 1)
+        
+        tau_00 = 1 - lh * la * rho
+        tau_10 = 1 + la * rho
+        tau_01 = 1 + lh * rho
+        tau_11 = 1 - rho
+        
+        # Probabilidad de aceptación para cada tipo de marcador bajo
+        accept = np.ones(len(gh))
+        accept[mask_00] = np.clip(tau_00, 0, 1) if np.isscalar(tau_00) else np.clip(tau_00[mask_00], 0, 1)
+        accept[mask_10] = np.clip(tau_10, 0, 2) if np.isscalar(tau_10) else np.clip(tau_10[mask_10], 0, 2)
+        accept[mask_01] = np.clip(tau_01, 0, 2) if np.isscalar(tau_01) else np.clip(tau_01[mask_01], 0, 2)
+        accept[mask_11] = np.clip(tau_11, 0, 1) if np.isscalar(tau_11) else np.clip(tau_11[mask_11], 0, 1)
+        
+        # Normalizar al rango [0,1] para rejection sampling
+        accept = np.minimum(accept, 1.0)
+        reject = rng.random(len(gh)) > accept
+        
+        # Regenerar los rechazados
+        if reject.any():
+            gh[reject] = rng.poisson(lh, reject.sum())
+            ga[reject] = rng.poisson(la, reject.sum())
+        
+        return gh, ga
+
     xg = _build_elo_xg_matrix()
 
     real_res = load_real_results()
@@ -1099,7 +1140,12 @@ def get_simulation_results():
     player_weights_mat = np.zeros((N_TEAMS, 23), dtype=np.float32)
     for i, t in enumerate(TEAM_ORDER_LIST):
         if t in pw_weights:
-            player_weights_mat[i] = pw_weights[t]
+            w = np.array(pw_weights[t], dtype=np.float32)
+            w_sum = w.sum()
+            if w_sum > 0:
+                player_weights_mat[i] = w / w_sum  # normalizar a suma=1
+            else:
+                player_weights_mat[i, 0] = 1.0
         else:
             player_weights_mat[i, 0] = 1.0
 
@@ -1162,6 +1208,7 @@ def get_simulation_results():
                 
                 gh = gh_players.sum(axis=1).astype(np.int16)
                 ga = ga_players.sum(axis=1).astype(np.int16)
+                gh, ga = apply_dc_correction_vectorized(gh, ga, lh, la, rho, rng)
             pts[:, h_i] += np.where(gh > ga, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             pts[:, a_i] += np.where(ga > gh, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             gd[:, h_i] += (gh - ga)
@@ -1212,6 +1259,7 @@ def get_simulation_results():
             lh = xg[h, a, 0].astype(np.float64)
             la = xg[h, a, 1].astype(np.float64)
             gh = rng.poisson(lh); ga = rng.poisson(la)
+            gh, ga = apply_dc_correction_vectorized(gh, ga, lh, la, rho, rng)
             skill_h = v_get_ps(h)
             skill_a = v_get_ps(a)
             prob_h = skill_h / (skill_h + skill_a + 1e-9)
@@ -1437,7 +1485,7 @@ elif page == "📊 Simulación Montecarlo":
 
     with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        results_df, top_scorers_df = get_simulation_results()
+        results_df, top_scorers_df = get_simulation_results(_cache_key=_get_results_cache_key())
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
@@ -1679,7 +1727,6 @@ elif page == "📝 Resultados en Vivo":
                 key = f"{team_h}|{team_a}"
                 real_res[key] = {"g_h": g_h, "g_a": g_a}
                 save_real_results(real_res)
-                st.cache_data.clear()
                 st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
                 
     if real_res:
@@ -1694,25 +1741,26 @@ elif page == "📝 Resultados en Vivo":
             if col2.button("🗑️", key=f"del_{k}"):
                 del real_res[k]
                 save_real_results(real_res)
-                st.cache_data.clear()
                 st.rerun()
 
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🏆 Proyección Actualizada")
     with st.spinner("⚡ Recalculando 100,000 simulaciones con los resultados reales..."):
-        results_df, top_scorers_df = get_simulation_results()
+        results_df, top_scorers_df = get_simulation_results(_cache_key=_get_results_cache_key())
         
     st.dataframe(
         results_df,
         column_config={
             "Team": st.column_config.TextColumn("Selección", width=160),
-            "Group Stage (%)": st.column_config.NumberColumn("16vos", format="%.1f%%"),
-            "Round of 32 (%)": st.column_config.NumberColumn("Octavos", format="%.1f%%"),
-            "Round of 16 (%)": st.column_config.NumberColumn("Cuartos", format="%.1f%%"),
-            "Quarterfinals (%)": st.column_config.NumberColumn("Semis", format="%.1f%%"),
-            "Semifinals (%)": st.column_config.NumberColumn("Final", format="%.1f%%"),
-            "Final (%)": st.column_config.NumberColumn("Campeón", format="%.1f%%"),
-            "Winner (%)": st.column_config.ProgressColumn("Probabilidad Título", format="%.1f%%", min_value=0, max_value=100),
+            "Group Stage (%)": st.column_config.NumberColumn("Fase Grupos %", format="%.1f%%"),
+            "Round of 32 (%)": st.column_config.NumberColumn("16vos %", format="%.1f%%"),
+            "Round of 16 (%)": st.column_config.NumberColumn("Octavos %", format="%.1f%%"),
+            "Quarterfinals (%)": st.column_config.NumberColumn("Cuartos %", format="%.1f%%"),
+            "Semifinals (%)": st.column_config.NumberColumn("Semifinal %", format="%.1f%%"),
+            "Final (%)": st.column_config.NumberColumn("Final %", format="%.1f%%"),
+            "Winner (%)": st.column_config.ProgressColumn(
+                "🏆 Campeón %", format="%.1f%%", min_value=0, max_value=100
+            ),
         },
         hide_index=True,
         height=600,
