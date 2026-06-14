@@ -1567,16 +1567,17 @@ elif page == "📝 Resultados en Vivo":
                 st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
                 
     if real_res:
-    st.markdown("### Resultados Guardados")
-    for k, v in list(real_res.items()):
-        parts = k.split("|")
-        if len(parts) == 2:
-            t1, t2 = parts
-            # FIX SEGURO: Usamos .get() para evitar KeyError si el JSON está corrupto
-            gh = v.get('g_h', 0)
-            ga = v.get('g_a', 0)
+        st.markdown("### Resultados Guardados")
+        for k, v in list(real_res.items()):
+            # Safe unpack to avoid ValueError on legacy keys
+            parts = k.split("|")
+            if len(parts) == 2:
+                t1, t2 = parts
+            else:
+                t1, t2 = k, "N/A"
+                
             col1, col2 = st.columns([8, 1])
-            col1.markdown(f"**{t1}** {gh} - {ga} **{t2}**")
+            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
             if col2.button("🗑️", key=f"del_{k}"):
                 del real_res[k]
                 save_real_results(real_res)
