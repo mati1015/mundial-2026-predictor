@@ -12,6 +12,7 @@ Referencia: Zeileis & Groll (2018) · Baio & Blangiardo (2010)
 from __future__ import annotations
 
 import warnings
+import os
 import time
 import sys
 from pathlib import Path
@@ -338,6 +339,7 @@ QUALIFIED_TEAMS = [
 
 CO_HOSTS = {"United States", "Mexico", "Canada"}
 N_TEAMS = len(QUALIFIED_TEAMS)
+TEAM_ORDER_LIST = list(QUALIFIED_TEAMS)
 TEAM_TO_IDX = {t: i for i, t in enumerate(QUALIFIED_TEAMS)}
 
 # Paleta de colores plotly
@@ -378,7 +380,6 @@ _BASE_ELO: dict[str, float] = {
     "Cabo Verde": 1810, "Jordan": 1840, "Congo DR": 1820, "Ghana": 1850,
 }
 
-import os
 import pandas as pd
 
 # Inyectar el Squad Quality Index (Nivel Micro) extraído de FBref si el archivo existe
@@ -446,6 +447,11 @@ def _build_elo_xg_matrix() -> np.ndarray:
     form = calculate_form_multipliers()
     xg = np.zeros((N_TEAMS, N_TEAMS, 2), dtype=np.float32)
 
+    try:
+        h2h_dict = get_all_h2h_stats()
+    except:
+        h2h_dict = {}
+        
     for i in range(N_TEAMS):
         for j in range(N_TEAMS):
             if i == j: continue
@@ -457,7 +463,8 @@ def _build_elo_xg_matrix() -> np.ndarray:
             sqi_i = sqi.get(t_i, 1.0)
             sqi_j = sqi.get(t_j, 1.0)
             
-            e_i = elo_i * 0.40 + (elo_i * sqi_i) * 0.60
+            sqi_c = max(0.85, min(1.15, sqi_i))
+            e_i = elo_i * 0.40 + (elo_i * sqi_c) * 0.60
             e_j = elo_j * 0.40 + (elo_j * sqi_j) * 0.60
             
             xg_i, xg_j = _elo_xg(e_i, e_j, t_i, t_j)
@@ -479,6 +486,26 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     logistics = load_logistics_data()
     team_last_day = {t: 0 for t in QUALIFIED_TEAMS}
     team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
+
+    try:
+        import json
+        with open('player_weights.json', 'r', encoding='utf-8') as f:
+            pw_data = json.load(f)
+            pw_weights = pw_data['weights']
+            pw_names = pw_data['names']
+    except:
+        pw_weights = {}
+        pw_names = {}
+        
+    player_weights_mat = np.zeros((N_TEAMS, 23), dtype=np.float32)
+    for i, t in enumerate(TEAM_ORDER_LIST):
+        if t in pw_weights:
+            player_weights_mat[i] = pw_weights[t]
+        else:
+            player_weights_mat[i, 0] = 1.0
+
+    total_player_goals = np.zeros((N_TEAMS, 23), dtype=np.int32)
+
 
 
     # Grupos según WC2026_GROUPS
@@ -536,8 +563,15 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
     # R32
-    r32_h = np.hstack([winners[:, 0:8],   winners[:, 8:12],    runners_up[:, 4:8]])
-    r32_a = np.hstack([best_thirds,        runners_up[:, 0:4],  runners_up[:, 8:12]])
+    # Bug 5: Randomización del bracket para evitar sesgo estructural en el Montecarlo
+    # Los 8 mejores terceros se permutan aleatoriamente contra los 8 campeones de grupo.
+    # Así simulamos la incerteza de la tabla de 495 combinaciones de la FIFA.
+    rand_thirds = rng.permuted(best_thirds, axis=1)
+    rand_runners_1 = rng.permuted(runners_up[:, 0:4], axis=1)
+    rand_runners_2 = rng.permuted(runners_up[:, 8:12], axis=1)
+    
+    r32_h = np.hstack([winners[:, 0:8], winners[:, 8:12], runners_up[:, 4:8]])
+    r32_a = np.hstack([rand_thirds, rand_runners_1, rand_runners_2])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -602,7 +636,7 @@ def estimate_rho_from_data() -> dict:
         h_scores, a_scores = df["home_score"].values, df["away_score"].values
         xg_h, xg_a = np.zeros(N), np.zeros(N)
         for i, row in enumerate(df.itertuples()):
-            xh, xa = _elo_xg(_BASE_ELO.get(row.home_team, 1850), _BASE_ELO.get(row.away_team, 1850))
+            xh, xa = _elo_xg(_BASE_ELO.get(row.home_team, 1850), _BASE_ELO.get(row.away_team, 1850), home_team=row.home_team, away_team=row.away_team)
             xg_h[i] = xh
             xg_a[i] = xa
             
@@ -685,7 +719,9 @@ def predict_match_elo(home: str, away: str, max_g: int = 7) -> dict:
     sqi_h = sqi_dict.get(home, 1.0)
     sqi_a = sqi_dict.get(away, 1.0)
     
+    sqi_h = max(0.85, min(1.15, sqi_h))
     elo_h = base_elo_h * 0.40 + (base_elo_h * sqi_h) * 0.60
+    sqi_a = max(0.85, min(1.15, sqi_a))
     elo_a = base_elo_a * 0.40 + (base_elo_a * sqi_a) * 0.60
     
     xg_h, xg_a = _elo_xg(elo_h, elo_a, home, away)
@@ -1036,7 +1072,8 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def get_simulation_results() -> pd.DataFrame:
+def get_simulation_results():
+    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
     # CACHE BUSTER: 2026-06-12
     """Ejecuta la simulación de torneos en cache."""
@@ -1046,6 +1083,26 @@ def get_simulation_results() -> pd.DataFrame:
     logistics = load_logistics_data()
     team_last_day = {t: 0 for t in QUALIFIED_TEAMS}
     team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
+
+    try:
+        import json
+        with open('player_weights.json', 'r', encoding='utf-8') as f:
+            pw_data = json.load(f)
+            pw_weights = pw_data['weights']
+            pw_names = pw_data['names']
+    except:
+        pw_weights = {}
+        pw_names = {}
+        
+    player_weights_mat = np.zeros((N_TEAMS, 23), dtype=np.float32)
+    for i, t in enumerate(TEAM_ORDER_LIST):
+        if t in pw_weights:
+            player_weights_mat[i] = pw_weights[t]
+        else:
+            player_weights_mat[i, 0] = 1.0
+
+    total_player_goals = np.zeros((N_TEAMS, 23), dtype=np.int32)
+
 
 
     # Build group structure from WC2026_GROUPS
@@ -1076,8 +1133,8 @@ def get_simulation_results() -> pd.DataFrame:
         for a_local, b_local in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
             h_i, a_i = int(teams[a_local]), int(teams[b_local])
             
-            t_h = team_order[h_i]
-            t_a = team_order[a_i]
+            t_h = idx_to_team.get(h_i, "Unknown")
+            t_a = idx_to_team.get(a_i, "Unknown")
             k1 = f"{t_h}|{t_a}"
             k2 = f"{t_a}|{t_h}"
             
@@ -1088,8 +1145,21 @@ def get_simulation_results() -> pd.DataFrame:
                 gh = np.full(n, real_res[k2]["g_a"], dtype=np.int16)
                 ga = np.full(n, real_res[k2]["g_h"], dtype=np.int16)
             else:
-                gh = rng.poisson(float(xg[h_i, a_i, 0]), n).astype(np.int16)
-                ga = rng.poisson(float(xg[h_i, a_i, 1]), n).astype(np.int16)
+                lh = float(xg[h_i, a_i, 0])
+                la = float(xg[h_i, a_i, 1])
+                
+                # Generación granular por jugador (Fase 4)
+                lh_players = lh * player_weights_mat[h_i]
+                la_players = la * player_weights_mat[a_i]
+                
+                gh_players = rng.poisson(lh_players, size=(n, 23))
+                ga_players = rng.poisson(la_players, size=(n, 23))
+                
+                total_player_goals[h_i] += gh_players.sum(axis=0)
+                total_player_goals[a_i] += ga_players.sum(axis=0)
+                
+                gh = gh_players.sum(axis=1).astype(np.int16)
+                ga = ga_players.sum(axis=1).astype(np.int16)
             pts[:, h_i] += np.where(gh > ga, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             pts[:, a_i] += np.where(ga > gh, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             gd[:, h_i] += (gh - ga)
@@ -1116,8 +1186,15 @@ def get_simulation_results() -> pd.DataFrame:
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    r32_h = np.hstack([winners[:, 0:8],   winners[:, 8:12],    runners_up[:, 4:8]])
-    r32_a = np.hstack([best_thirds,        runners_up[:, 0:4],  runners_up[:, 8:12]])
+    # Bug 5: Randomización del bracket para evitar sesgo estructural en el Montecarlo
+    # Los 8 mejores terceros se permutan aleatoriamente contra los 8 campeones de grupo.
+    # Así simulamos la incerteza de la tabla de 495 combinaciones de la FIFA.
+    rand_thirds = rng.permuted(best_thirds, axis=1)
+    rand_runners_1 = rng.permuted(runners_up[:, 0:4], axis=1)
+    rand_runners_2 = rng.permuted(runners_up[:, 8:12], axis=1)
+    
+    r32_h = np.hstack([winners[:, 0:8], winners[:, 8:12], runners_up[:, 4:8]])
+    r32_a = np.hstack([rand_thirds, rand_runners_1, rand_runners_2])
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
@@ -1157,7 +1234,21 @@ def get_simulation_results() -> pd.DataFrame:
     df = pd.DataFrame({"Team": QUALIFIED_TEAMS})
     for k, p in enumerate(phases):
         df[p] = np.round((survival[:, k] / n) * 100, 2)
-    return df.sort_values("Winner (%)", ascending=False).reset_index(drop=True)
+    df_results = df.sort_values("Winner (%)", ascending=False).reset_index(drop=True)
+    
+    all_players = []
+    for i, t in enumerate(TEAM_ORDER_LIST):
+        if t in pw_names:
+            for j in range(23):
+                avg_goals = total_player_goals[i, j] / n
+                if avg_goals > 0.05:
+                    all_players.append({"Player": pw_names[t][j], "Team": t, "xG_Tournament": avg_goals})
+    
+    top_scorers_df = pd.DataFrame(all_players)
+    if not top_scorers_df.empty:
+        top_scorers_df = top_scorers_df.sort_values(by="xG_Tournament", ascending=False).head(20).reset_index(drop=True)
+    
+    return df_results, top_scorers_df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1461,6 +1552,33 @@ elif page == "📝 Resultados en Vivo":
                 save_real_results(real_res)
                 st.cache_data.clear()
                 st.rerun()
+
+
+
+    st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
+    st.markdown("### 🥇 Predicción de Goleadores (Botín de Oro / MVP)")
+    st.markdown("Generado simulando individualmente las acciones de cada uno de los 1100 jugadores en los 6.4 millones de partidos del Montecarlo.")
+    
+    if not top_scorers_df.empty:
+        fig_scorers = px.bar(
+            top_scorers_df.head(15).sort_values("xG_Tournament", ascending=True),
+            x="xG_Tournament",
+            y="Player",
+            color="Team",
+            orientation="h",
+            text_auto=".2f",
+            title="Goles Esperados Promedio por Torneo",
+            color_discrete_sequence=px.colors.qualitative.Pastel
+        )
+        fig_scorers.update_layout(
+            **PLOTLY_LAYOUT,
+            xaxis_title="Goles",
+            yaxis_title="",
+            height=500
+        )
+        st.plotly_chart(fig_scorers, use_container_width=True)
+    else:
+        st.info("Datos de jugadores no disponibles.")
 
 elif page == "🏅 Ranking Global":
     st.markdown("## Power Ranking · 48 Selecciones")
