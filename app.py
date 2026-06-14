@@ -34,17 +34,10 @@ import json
 REAL_RESULTS_FILE = "real_results.json"
 
 def load_real_results() -> dict:
-    if os.path.exists(REAL_RESULTS_FILE):
-        try:
-            with open(REAL_RESULTS_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+    return st.session_state.get("real_results", {})
 
 def save_real_results(res: dict):
-    with open(REAL_RESULTS_FILE, "w") as f:
-        json.dump(res, f)
+    st.session_state["real_results"] = res
 
 @st.cache_data(show_spinner=False)
 def load_h2h_data():
@@ -380,7 +373,7 @@ _BASE_ELO: dict[str, float] = {
     "Cabo Verde": 1810, "Jordan": 1840, "Congo DR": 1820, "Ghana": 1850,
 }
 
-import pandas as pd
+
 
 
 
@@ -430,7 +423,6 @@ def _elo_xg(elo_h: float, elo_a: float, home_team: str = "", away_team: str = ""
     xg_a = (1 - ea) * 2.8
     
     xg_h += HOME_ADVANTAGE_XG.get(home_team, 0.0)
-    xg_a += HOME_ADVANTAGE_XG.get(away_team, 0.0)
     
     return max(0.1, xg_h), max(0.1, xg_a)
 
@@ -440,10 +432,7 @@ def _build_elo_xg_matrix() -> np.ndarray:
     form = calculate_form_multipliers()
     xg = np.zeros((N_TEAMS, N_TEAMS, 2), dtype=np.float32)
 
-    try:
-        h2h_dict = get_all_h2h_stats()
-    except:
-        h2h_dict = {}
+    h2h_dict = get_all_h2h_stats()
         
     for i in range(N_TEAMS):
         for j in range(N_TEAMS):
@@ -549,7 +538,7 @@ def calculate_form_multipliers() -> dict:
                 form_score_sum += res * decay * quality_weight
                 weight_sum += decay * quality_weight
             form_score = form_score_sum / weight_sum if weight_sum > 0 else 0.5
-            form_mults[team] = 0.90 + (form_score * 0.20)
+            form_mults[team] = max(0.90, min(1.10, 0.90 + form_score * 0.20))
         return form_mults
     except Exception as e:
         print(f"Warning: calculate_form_multipliers failed - {e}")
@@ -908,7 +897,8 @@ with st.sidebar:
 
     rho_info = estimate_rho_from_data()
     ps_info = get_penalty_skill()
-    rho_label = f"ρ = {rho_info['rho']:.3f} {'(fallback)' if rho_info['fallback'] else f'N={rho_info["N"]}'}"
+    n_str = f"N={rho_info.get('N', 0)}"
+    rho_label = f"ρ = {rho_info['rho']:.3f} {'(fallback)' if rho_info['fallback'] else n_str}"
     ps_label = f"{'Datos reales' if len(ps_info) > 1 else 'Modelo 50/50'}"
     form_label = "Activo ✓"
 
@@ -938,7 +928,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 import hashlib
-import json
+
 
 def _get_results_cache_key() -> str:
     rr = load_real_results()
@@ -952,33 +942,61 @@ def get_simulation_results(_cache_key: str = ""):
     rho = estimate_rho_from_data()["rho"]
     
     def apply_dc_correction_vectorized(gh, ga, lh, la, rho, rng):
-        """Aplica corrección Dixon-Coles via rejection sampling vectorizado."""
-        mask_00 = (gh == 0) & (ga == 0)
-        mask_10 = (gh == 1) & (ga == 0)
-        mask_01 = (gh == 0) & (ga == 1)
-        mask_11 = (gh == 1) & (ga == 1)
+        """Aplica corrección Dixon-Coles escalando probabilidades conjuntas exactas."""
+        # Solo corregimos los partidos que caen en el bloque {0,1} x {0,1}
+        # Matemáticamente, Dixon-Coles conserva la probabilidad total de este bloque.
+        mask = (gh <= 1) & (ga <= 1)
+        if not mask.any():
+            return gh, ga
+            
+        n_low = mask.sum()
         
-        tau_00 = 1 - lh * la * rho
-        tau_10 = 1 + la * rho
-        tau_01 = 1 + lh * rho
-        tau_11 = 1 - rho
+        # Obtener lambdas correspondientes
+        lh_m = lh if np.isscalar(lh) else lh[mask]
+        la_m = la if np.isscalar(la) else la[mask]
         
-        # Probabilidad de aceptación para cada tipo de marcador bajo
-        accept = np.ones(len(gh))
-        accept[mask_00] = np.clip(tau_00, 0, 1) if np.isscalar(tau_00) else np.clip(tau_00[mask_00], 0, 1)
-        accept[mask_10] = np.clip(tau_10, 0, 2) if np.isscalar(tau_10) else np.clip(tau_10[mask_10], 0, 2)
-        accept[mask_01] = np.clip(tau_01, 0, 2) if np.isscalar(tau_01) else np.clip(tau_01[mask_01], 0, 2)
-        accept[mask_11] = np.clip(tau_11, 0, 1) if np.isscalar(tau_11) else np.clip(tau_11[mask_11], 0, 1)
+        # Probabilidades marginales ajustadas por tau
+        # (El factor exp(-lh-la) se cancela al normalizar)
+        p00 = np.maximum(0.0, 1 - lh_m * la_m * rho)
+        p10 = np.maximum(0.0, lh_m * (1 + la_m * rho))
+        p01 = np.maximum(0.0, la_m * (1 + lh_m * rho))
+        p11 = np.maximum(0.0, lh_m * la_m * (1 - rho))
         
-        # Normalizar al rango [0,1] para rejection sampling
-        accept = np.minimum(accept, 1.0)
-        reject = rng.random(len(gh)) > accept
+        # Normalizar a 1.0 dentro del bloque
+        p_sum = p00 + p10 + p01 + p11
+        p00 /= p_sum
+        p10 /= p_sum
+        p01 /= p_sum
         
-        # Regenerar los rechazados
-        if reject.any():
-            n_rej = reject.sum()
-            gh[reject] = rng.poisson(lh, n_rej) if np.isscalar(lh) else rng.poisson(lh[reject])
-            ga[reject] = rng.poisson(la, n_rej) if np.isscalar(la) else rng.poisson(la[reject])
+        # Muestreo uniforme vectorizado
+        u = rng.random(n_low)
+        
+        # Umbrales acumulados
+        c1 = p00
+        c2 = c1 + p10
+        c3 = c2 + p01
+        
+        gh_new = np.zeros(n_low, dtype=gh.dtype)
+        ga_new = np.zeros(n_low, dtype=ga.dtype)
+        
+        # Asignación de nuevos marcadores
+        # u < c1 -> (0,0) (ya en 0, no hacer nada)
+        
+        # (1,0): c1 <= u < c2
+        idx_10 = (u >= c1) & (u < c2)
+        gh_new[idx_10] = 1
+        
+        # (0,1): c2 <= u < c3
+        idx_01 = (u >= c2) & (u < c3)
+        ga_new[idx_01] = 1
+        
+        # (1,1): u >= c3
+        idx_11 = (u >= c3)
+        gh_new[idx_11] = 1
+        ga_new[idx_11] = 1
+        
+        gh[mask] = gh_new
+        ga[mask] = ga_new
         
         return gh, ga
 
@@ -990,7 +1008,7 @@ def get_simulation_results(_cache_key: str = ""):
     team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
 
     try:
-        import json
+
         with open('player_weights.json', 'r', encoding='utf-8') as f:
             pw_data = json.load(f)
             pw_weights = pw_data['weights']
@@ -999,19 +1017,20 @@ def get_simulation_results(_cache_key: str = ""):
         pw_weights = {}
         pw_names = {}
         
-    player_weights_mat = np.zeros((N_TEAMS, 23), dtype=np.float32)
+    player_weights_mat = np.zeros((N_TEAMS, 26), dtype=np.float32)
     for i, t in enumerate(TEAM_ORDER_LIST):
         if t in pw_weights:
             w = np.array(pw_weights[t], dtype=np.float32)
-            w_sum = w.sum()
+            w_len = min(len(w), 26)
+            w_sum = w[:w_len].sum()
             if w_sum > 0:
-                player_weights_mat[i] = w / w_sum  # normalizar a suma=1
+                player_weights_mat[i, :w_len] = w[:w_len] / w_sum  # normalizar a suma=1
             else:
                 player_weights_mat[i, 0] = 1.0
         else:
             player_weights_mat[i, 0] = 1.0
 
-    total_player_goals = np.zeros((N_TEAMS, 23), dtype=np.int32)
+    total_player_goals = np.zeros((N_TEAMS, 26), dtype=np.int32)
 
 
 
@@ -1028,11 +1047,12 @@ def get_simulation_results(_cache_key: str = ""):
             if len(team_order) == 48:
                 break
 
-    rng = np.random.default_rng(2026)
+    # Semilla dinámica para el RNG basada en el hash de los resultados reales
+    seed = int(hashlib.md5(_cache_key.encode()).hexdigest()[:8], 16) if _cache_key else 2026
+    rng = np.random.default_rng(seed)
     group_idxs = np.array([TEAM_TO_IDX[t] for t in team_order[:48]], dtype=np.int32).reshape(12, 4)
 
-    survival = np.zeros((N_TEAMS, 7), dtype=np.int32)
-    survival[:, 0] = n
+    survival = np.zeros((N_TEAMS, 6), dtype=np.int32)
 
     pts = np.zeros((n, N_TEAMS), dtype=np.int16)
     gd  = np.zeros((n, N_TEAMS), dtype=np.int16)
@@ -1062,8 +1082,8 @@ def get_simulation_results(_cache_key: str = ""):
                 lh_players = lh * player_weights_mat[h_i]
                 la_players = la * player_weights_mat[a_i]
                 
-                gh_players = rng.poisson(lh_players, size=(n, 23))
-                ga_players = rng.poisson(la_players, size=(n, 23))
+                gh_players = rng.poisson(lh_players, size=(n, 26))
+                ga_players = rng.poisson(la_players, size=(n, 26))
                 
                 total_player_goals[h_i] += gh_players.sum(axis=0)
                 total_player_goals[a_i] += ga_players.sum(axis=0)
@@ -1139,40 +1159,50 @@ def get_simulation_results(_cache_key: str = ""):
             for t in group_idxs[g]:
                 t2g[int(t)] = g
         
-        # Los 16 partidos R32 según FIFA 2026:
-        # Partidos fijos (ganadores de grupo vs subcampeones del grupo opuesto):
-        # Mapeo oficial cruzado por mitades del cuadro:
-        fixed_w_idx  = [0, 1, 2, 3, 4, 5, 6, 7, 8,  9,  10, 11]
-        fixed_ru_idx = [2, 3, 0, 1, 6, 7, 4, 5, 10, 11,  8,  9]
-        # Esto garantiza: winners[g] nunca vs runners_up[g] (mismo grupo)
-        # Los 8 mejores terceros se asignan a 8 posiciones específicas del bracket.
-        # Según FIFA 2026, los terceros se emparejan contra ganadores de grupo
-        # de los grupos que NO son el suyo. Usamos asignación aleatoria anti-colisión.
-        
-        # t2g mapea team_idx → group (ya construido arriba)
-        bt_groups = t2g[best_thirds]  # (n, 8) — grupo de origen de cada 3ro
-        
-        # Los 8 ganadores candidatos a recibir un tercer lugar:
-        # winners[:,0:8] son los 8 ganadores de A-H
-        # Para cada 3ro, su grupo de origen no puede coincidir con el ganador rival
-        candidates_w = winners[:, :8]          # (n, 8)
-        candidates_w_grp = np.arange(8)        # grupos 0-7
-        
-        # Permutación aleatoria de los 8 terceros
+        # Los 16 partidos R32 según FIFA 2026 predeterminados M73 a M88:
+        # Permutación aleatoria de los 8 terceros para distribuirlos en los 8 partidos contra 1°
         perm = rng.permuted(np.arange(8).reshape(1,8).repeat(n, axis=0), axis=1)
         bt_ordered = np.take_along_axis(best_thirds, perm, axis=1)  # (n,8)
         
-        # Los 8 ganadores A-H vs los 8 mejores terceros (permutados)
-        # Reemplaza los 4 partidos extra — ahora son 8 partidos adicionales
-        # PERO el bracket es de 16 total, así que los 12 fijos + 4 de terceros
-        # deben resolverse redistribuyendo: 8 ganadores A-H vs 8 terceros,
-        # Y los 4 ganadores I-L vs 4 subcampeones cruzados
-        
-        r32_h_final = np.hstack([candidates_w, winners[:, 8:12]])    # (n,12)
-        r32_a_final = np.hstack([bt_ordered,   runners_up[:, np.array([10,11,8,9])]])  # (n,12)
-        # ⚠ Esto da solo 12 partidos — falta completar con los 4 subcampeones A-D vs E-H
-        r32_h_final = np.hstack([r32_h_final, runners_up[:, :4]])    # (n,16)
-        r32_a_final = np.hstack([r32_a_final, runners_up[:, 4:8]])   # (n,16)
+        # Equipos locales (M73 a M88)
+        r32_h_final = np.column_stack([
+            runners_up[:, 0],  # M73: 2A
+            winners[:, 4],     # M74: 1E
+            winners[:, 5],     # M75: 1F
+            winners[:, 2],     # M76: 1C
+            winners[:, 8],     # M77: 1I
+            runners_up[:, 4],  # M78: 2E
+            winners[:, 0],     # M79: 1A
+            winners[:, 11],    # M80: 1L
+            winners[:, 3],     # M81: 1D
+            winners[:, 6],     # M82: 1G
+            runners_up[:, 10], # M83: 2K
+            winners[:, 7],     # M84: 1H
+            winners[:, 1],     # M85: 1B
+            winners[:, 9],     # M86: 1J
+            winners[:, 10],    # M87: 1K
+            runners_up[:, 3]   # M88: 2D
+        ])
+
+        # Equipos visitantes (M73 a M88)
+        r32_a_final = np.column_stack([
+            runners_up[:, 1],  # M73: 2B
+            bt_ordered[:, 0],  # M74: 3(A/B/C/D/F)
+            runners_up[:, 2],  # M75: 2C
+            runners_up[:, 5],  # M76: 2F
+            bt_ordered[:, 1],  # M77: 3(C/D/F/G/H)
+            runners_up[:, 8],  # M78: 2I
+            bt_ordered[:, 2],  # M79: 3(C/E/F/H/I)
+            bt_ordered[:, 3],  # M80: 3(E/H/I/J/K)
+            bt_ordered[:, 4],  # M81: 3(B/E/F/I/J)
+            bt_ordered[:, 5],  # M82: 3(A/E/H/I/J)
+            runners_up[:, 11], # M83: 2L
+            runners_up[:, 9],  # M84: 2J
+            bt_ordered[:, 6],  # M85: 3(E/F/G/I/J)
+            runners_up[:, 7],  # M86: 2H
+            bt_ordered[:, 7],  # M87: 3(D/E/I/J/L)
+            runners_up[:, 6]   # M88: 2G
+        ])
         
         return r32_h_final, r32_a_final
     
@@ -1206,15 +1236,15 @@ def get_simulation_results(_cache_key: str = ""):
         return adv
 
     u_r32, c_r32 = np.unique(np.hstack([r32_h, r32_a]), return_counts=True)
-    survival[u_r32, 1] += c_r32
+    survival[u_r32, 0] += c_r32
 
-    r16 = ko_round(r32_h, r32_a, 2)
-    qf  = ko_round(r16[:, :8], r16[:, 8:], 3)
-    sf  = ko_round(qf[:, :4],  qf[:, 4:],  4)
-    fin = ko_round(sf[:, :2],  sf[:, 2:],  5)
-    ko_round(fin[:, :1], fin[:, 1:], 6)
+    r16 = ko_round(r32_h, r32_a, 1)
+    qf  = ko_round(r16[:, :8], r16[:, 8:], 2)
+    sf  = ko_round(qf[:, :4],  qf[:, 4:],  3)
+    fin = ko_round(sf[:, :2],  sf[:, 2:],  4)
+    ko_round(fin[:, :1], fin[:, 1:], 5)
 
-    phases = ["Group Stage (%)", "Round of 32 (%)", "Round of 16 (%)",
+    phases = ["Round of 32 (%)", "Round of 16 (%)",
               "Quarterfinals (%)", "Semifinals (%)", "Final (%)", "Winner (%)"]
     df = pd.DataFrame({"Team": QUALIFIED_TEAMS})
     for k, p in enumerate(phases):
@@ -1224,7 +1254,8 @@ def get_simulation_results(_cache_key: str = ""):
     all_players = []
     for i, t in enumerate(TEAM_ORDER_LIST):
         if t in pw_names:
-            for j in range(23):
+            w_len = min(len(pw_names[t]), 26)
+            for j in range(w_len):
                 avg_goals = total_player_goals[i, j] / n
                 if avg_goals > 0.05:
                     all_players.append({"Player": pw_names[t][j], "Team": t, "xG_Tournament": avg_goals})
