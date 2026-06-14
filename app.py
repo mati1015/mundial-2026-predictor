@@ -400,7 +400,7 @@ def build_ensemble_engine():
         xg_fallback = _build_elo_xg_matrix()
         # Llamar sin decorador de caché para evitar deadlock
         rr_key = _get_results_cache_key()
-        df_fallback, _ = get_simulation_results(_cache_key=rr_key)
+        df_fallback, _ = get_simulation_results(cache_key=rr_key)
         return xg_fallback, df_fallback
 
 
@@ -935,7 +935,7 @@ def _get_results_cache_key() -> str:
     return hashlib.md5(json.dumps(rr, sort_keys=True).encode()).hexdigest()
 
 @st.cache_data(show_spinner=False)
-def get_simulation_results(_cache_key: str = ""):
+def get_simulation_results(cache_key: str = ""):
     """Ejecuta la simulación de torneos en cache."""
     idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
@@ -1048,7 +1048,7 @@ def get_simulation_results(_cache_key: str = ""):
                 break
 
     # Semilla dinámica para el RNG basada en el hash de los resultados reales
-    seed = int(hashlib.md5(_cache_key.encode()).hexdigest()[:8], 16) if _cache_key else 2026
+    seed = int(hashlib.md5(cache_key.encode()).hexdigest()[:8], 16) if cache_key else 2026
     rng = np.random.default_rng(seed)
     group_idxs = np.array([TEAM_TO_IDX[t] for t in team_order[:48]], dtype=np.int32).reshape(12, 4)
 
@@ -1451,7 +1451,7 @@ elif page == "📊 Simulación Montecarlo":
 
     with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        results_df, top_scorers_df = get_simulation_results(_cache_key=_get_results_cache_key())
+        results_df, top_scorers_df = get_simulation_results(cache_key=_get_results_cache_key())
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
@@ -1713,7 +1713,7 @@ elif page == "📝 Resultados en Vivo":
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🏆 Proyección Actualizada")
     with st.spinner("⚡ Recalculando 100,000 simulaciones con los resultados reales..."):
-        results_df, top_scorers_df = get_simulation_results(_cache_key=_get_results_cache_key())
+        results_df, top_scorers_df = get_simulation_results(cache_key=_get_results_cache_key())
         
     st.dataframe(
         results_df,
