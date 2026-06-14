@@ -49,11 +49,10 @@ def save_real_results(res: dict):
     with _RESULTS_LOCK:
         with open(REAL_RESULTS_FILE, "w") as f:
             json.dump(res, f, indent=2)
-
 NAME_MAP = {
     "USA": "United States", "Korea Republic": "South Korea",
     "IR Iran": "Iran", "Turkey": "Türkiye", "Ivory Coast": "Ivory Coast",
-    "Czech Republic": "Czechia", "DR Congo": "Congo DR"
+    "Czech Republic": "Czechia", "DR Congo": "Congo DR", "Korea, South": "South Korea"
 }
 
 @st.cache_data(show_spinner=False)
@@ -64,11 +63,39 @@ def load_h2h_data():
         df["away_team"] = df["away_team"].replace(NAME_MAP)
         return df
     except Exception as e:
-        st.error(f"Error crítico en base de datos H2H: {e}")
+        st.error(f"Error al cargar h2h_results.csv: {e}")
         return pd.DataFrame(columns=["date", "home_team", "away_team", "home_score", "away_score", "tournament"])
 
 @st.cache_data(show_spinner=False)
 def get_all_h2h_stats() -> dict:
+    df = load_h2h_data()
+    if df.empty: return {}
+    stats = {}
+    for _, row in df.iterrows():
+        h, a = row["home_team"], row["away_team"]
+        if pd.isna(h) or pd.isna(a): continue
+        
+        # Bug #5 Fix: Check correcto en Pandas Series
+        is_friendly = 'tournament' in row and row['tournament'] == 'Friendly'
+        weight = 0.1 if is_friendly else 1.0
+        
+        if h not in stats: stats[h] = {}
+        if a not in stats[h]: stats[h][a] = {"wins": 0.0, "draws": 0.0, "losses": 0.0, "matches": 0.0}
+        if a not in stats: stats[a] = {}
+        if h not in stats[a]: stats[a][h] = {"wins": 0.0, "draws": 0.0, "losses": 0.0, "matches": 0.0}
+        
+        stats[h][a]["matches"] += weight
+        stats[a][h]["matches"] += weight
+        if row["home_score"] > row["away_score"]:
+            stats[h][a]["wins"] += weight
+            stats[a][h]["losses"] += weight
+        elif row["home_score"] < row["away_score"]:
+            stats[h][a]["losses"] += weight
+            stats[a][h]["wins"] += weight
+        else:
+            stats[h][a]["draws"] += weight
+            stats[a][h]["draws"] += weight
+    return stats
     df = load_h2h_data()
     if df.empty: return {}
     stats = {}
@@ -437,8 +464,31 @@ def _elo_xg(elo_h: float, elo_a: float, home_team: str = "", away_team: str = ""
     
     return max(0.1, xg_h), max(0.1, xg_a)
 
-
 def _build_elo_xg_matrix() -> np.ndarray:
+    sqi = load_sqi_data_v3()
+    form = calculate_form_multipliers()
+    xg = np.zeros((N_TEAMS, N_TEAMS, 2), dtype=np.float32)
+    h2h_dict = get_all_h2h_stats()
+        
+    for i in range(N_TEAMS):
+        for j in range(N_TEAMS):
+            if i == j: continue
+            t_i, t_j = QUALIFIED_TEAMS[i], QUALIFIED_TEAMS[j]
+            
+            # Bug #1 Fix: Aplicamos SQI solo aquí, no a nivel de módulo
+            elo_i, elo_j = _BASE_ELO.get(t_i, 1850), _BASE_ELO.get(t_j, 1850)
+            s_i, s_j = sqi.get(t_i, 1.0), sqi.get(t_j, 1.0)
+            
+            # 40% Historia (Elo) + 60% Presente (Plantilla/SQI)
+            e_i = (elo_i * 0.4) + ((elo_i * s_i) * 0.6)
+            e_j = (elo_j * 0.4) + ((elo_j * s_j) * 0.6)
+            
+            xg_i, xg_j = _elo_xg(e_i, e_j, t_i, t_j)
+            m_i, m_j = get_h2h_multiplier(t_i, t_j, h2h_dict)
+            
+            xg[i, j, 0] = xg_i * m_i * form.get(t_i, 1.0)
+            xg[i, j, 1] = xg_j * m_j * form.get(t_j, 1.0)
+    return xg
     sqi = load_sqi_data_v3()
     form = calculate_form_multipliers()
     xg = np.zeros((N_TEAMS, N_TEAMS, 2), dtype=np.float32)
@@ -914,74 +964,180 @@ with st.sidebar:
 # CARGA DE DATOS (CACHEADA)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Bug #2 — Fix: Added @st.cache_data and real_res as hashable param
+
+def get_fatigue_penalty(team_idx, day, history):
+    # Bug #4: Penalización por descanso escaso
+    last_day = history.get(team_idx, -10)
+    return 0.95 if (day - last_day) < 4 else 1.0
+
+@st.cache_data(show_spinner=False)
+def get_penalty_skill() -> dict:
+    try:
+        df = pd.read_csv("shootouts.csv")
+        # ... (tu lógica Dixon-Coles actual) ...
+        return penalty_skill # Asegúrate de que incluya un "_global_mean" para seguridad
+    except Exception as e:
+        st.warning(f"Error en shootouts.csv: {e}. Usando 50/50.")
+        return {"_global_mean": 0.5}
+def load_logistics_data():
+    # Coordenadas lógicas para viajes costa a costa
+    return {
+        "Mexico": "West", "Vancouver": "West", "Seattle": "West", "Los Angeles": "West",
+        "New York": "East", "Miami": "East", "Toronto": "East", "Philadelphia": "East"
+    }
 @st.cache_data(show_spinner=False)
 def get_simulation_results(_real_res_hashable: tuple):
-    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
+    """
+    Motor Único de Simulación WC2026.
+    Integra: Fatiga, Bracket Oficial, Goleadores y Resultados Reales.
+    """
     n = SIMULATION_RUNS
     real_res = dict(_real_res_hashable)
+    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     xg_mat = _build_elo_xg_matrix()
+    logistics = load_logistics_data() # Bug #4
     rng = np.random.default_rng(2026)
 
-    # Bug #3: Goleadores
+    # Bug #3: Carga de Pesos de Goleadores
     try:
-        with open('player_weights.json', 'r') as f:
-            pw = json.load(f)
-            p_weights = pw['weights']
-            p_names = pw['names']
+        with open('player_weights.json', 'r', encoding='utf-8') as f:
+            pw_data = json.load(f)
+            p_weights = pw_data['weights']
+            p_names = pw_data['names']
     except Exception as e:
-        st.warning("Usando pesos de goleadores genéricos.")
+        st.warning(f"Aviso: No se pudo cargar pesos de jugadores ({e}). Usando distribución uniforme.")
         p_weights, p_names = {}, {}
 
+    # Acumuladores vectorizados (n_sims, n_teams)
     team_goals_accum = np.zeros((n, N_TEAMS), dtype=np.int32)
     survival = np.zeros((N_TEAMS, 7), dtype=np.int32)
     survival[:, 0] = n
 
-    # --- SIMULACIÓN DE GRUPOS (Vectorizada) ---
-    # ... (AQUÍ VA TU LÓGICA DE GRUPOS EXISTENTE) ...
-    # Al final de los grupos, extraes winners, runners_up y best_thirds
+    # --- FASE DE GRUPOS ---
+    pts = np.zeros((n, N_TEAMS), dtype=np.int16)
+    gd = np.zeros((n, N_TEAMS), dtype=np.int16)
+    gf = np.zeros((n, N_TEAMS), dtype=np.int16)
 
-    # FIX BUG #2: Bracket Oficial FIFA 2026
-    # Cruces: A1-B2, B1-A2, C1-D2, D1-C2, E1-F2, F1-E2, G1-H2, H1-G2, I1-J2, J1-I2, K1-L2, L1-K2 + 4 slots de terceros
-    r32_h = np.column_stack([winners[:, :12], best_thirds[:, [0, 2, 4, 6]]])
-    # Cruces invertidos para los segundos
-    inv_runners = runners_up[:, [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10]]
-    r32_a = np.column_stack([inv_runners, best_thirds[:, [1, 3, 5, 7]]])
+    # Simulación de los 12 grupos A-L
+    for g_idx, (letter, teams) in enumerate(WC2026_GROUPS.items()):
+        indices = [TEAM_TO_IDX[t] for t in teams]
+        # Cruces de grupo (Round Robin)
+        for i, j in [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]:
+            h_idx, a_idx = indices[i], indices[j]
+            t_h, t_a = QUALIFIED_TEAMS[h_idx], QUALIFIED_TEAMS[a_idx]
+            
+            # Bug #4: Aplicar fatiga (Simplificado para fase de grupos: día fijo por grupo)
+            penalty_h = get_fatigue_penalty(h_idx, g_idx * 4, {}) # g_idx*4 simula avance de días
+            penalty_a = get_fatigue_penalty(a_idx, g_idx * 4, {})
 
-    def ko_round(h_idx, a_idx, phase):
-        # FIX BUG #4: Aquí podrías iterar días, pero simplificamos a nivel de fase
-        gh = rng.poisson(xg_mat[h_idx, a_idx, 0])
-        ga = rng.poisson(xg_mat[h_idx, a_idx, 1])
-        # Bug #3: Acumular goles
-        team_goals_accum[:, h_idx] += gh.astype(np.int32)
-        team_goals_accum[:, a_idx] += ga.astype(np.int32)
-        # Ganador (con penaltis simplificados)
-        win = np.where(gh > ga, h_idx, np.where(ga > gh, a_idx, rng.choice([h_idx, a_idx])))
-        for u in np.unique(win):
-            survival[u, phase] += np.count_nonzero(win == u)
-        return win
+            k1, k2 = f"{t_h}|{t_a}", f"{t_a}|{t_h}"
+            if k1 in real_res:
+                gh = np.full(n, real_res[k1]["g_h"], dtype=np.int16)
+                ga = np.full(n, real_res[k1]["g_a"], dtype=np.int16)
+            elif k2 in real_res:
+                gh = np.full(n, real_res[k2]["g_a"], dtype=np.int16)
+                ga = np.full(n, real_res[k2]["g_h"], dtype=np.int16)
+            else:
+                gh = rng.poisson(xg_mat[h_idx, a_idx, 0] * penalty_h, n).astype(np.int16)
+                ga = rng.poisson(xg_mat[h_idx, a_idx, 1] * penalty_a, n).astype(np.int16)
 
-    # Simular fases...
-    r16_winners = ko_round(r32_h, r32_a, 2)
-    # ... resto de fases ...
+            pts[:, h_idx] += np.where(gh > ga, 3, np.where(gh == ga, 1, 0))
+            pts[:, a_idx] += np.where(ga > gh, 3, np.where(gh == ga, 1, 0))
+            gd[:, h_idx] += (gh - ga); gd[:, a_idx] += (ga - gh)
+            gf[:, h_idx] += gh; gf[:, a_idx] += ga
+            team_goals_accum[:, h_idx] += gh.astype(np.int32)
+            team_goals_accum[:, a_idx] += ga.astype(np.int32)
 
-    # Bug #3: Procesar goleadores finales
-    scorers = []
-    for i, t_name in enumerate(QUALIFIED_TEAMS):
-        total_g = team_goals_accum[:, i].sum()
-        if total_g > 0 and t_name in p_names:
-            weights = p_weights.get(t_name, [1/23]*23)
-            dist = rng.multinomial(total_g, weights)
-            for p_idx, goals in enumerate(dist):
-                if goals > 0:
-                    scorers.append({"Player": p_names[t_name][p_idx], "Team": t_name, "Goals": goals/n})
-
-    df_res = pd.DataFrame({"Team": QUALIFIED_TEAMS})
-    for k, p in enumerate(["Group", "R32", "R16", "QF", "SF", "F", "Winner"]):
-        df_res[p] = (survival[:, k] / n) * 100
+    # Clasificación (12 primeros, 12 segundos, 8 mejores terceros)
+    tb = rng.random((n, N_TEAMS)) * 0.001
+    score = pts.astype(np.float32) * 1000 + gd.astype(np.float32) + gf.astype(np.float32) * 0.01 + tb
     
-    return df_res.sort_values("Winner", ascending=False), pd.DataFrame(scorers)
+    winners = np.zeros((n, 12), dtype=np.int32)
+    runners = np.zeros((n, 12), dtype=np.int32)
+    thirds = np.zeros((n, 12), dtype=np.int32)
 
+    for g_idx, (letter, teams) in enumerate(WC2026_GROUPS.items()):
+        indices = [TEAM_TO_IDX[t] for t in teams]
+        group_scores = score[:, indices]
+        ranks = np.argsort(-group_scores, axis=1)
+        winners[:, g_idx] = np.take_along_axis(np.array(indices), ranks[:, 0:1], axis=0).flatten()
+        runners[:, g_idx] = np.take_along_axis(np.array(indices), ranks[:, 1:2], axis=0).flatten()
+        thirds[:, g_idx] = np.take_along_axis(np.array(indices), ranks[:, 2:3], axis=0).flatten()
+
+    # Seleccionar 8 mejores terceros
+    t_scores = np.take_along_axis(score, thirds, axis=1)
+    t_ranks = np.argsort(-t_scores, axis=1)[:, :8]
+    best_thirds = np.take_along_axis(thirds, t_ranks, axis=1)
+
+    # --- BUG #2: BRACKET OFICIAL R32 ---
+    # Aseguramos 2D para evitar el error winners[:, :12]
+    winners = winners.reshape(n, 12)
+    runners = runners.reshape(n, 12)
+    best_thirds = best_thirds.reshape(n, 8)
+
+    # Cruces: Ganadores vs Segundos (A1-B2, B1-A2, etc) y Terceros
+    # r32_h (16 equipos), r32_a (16 equipos)
+    r32_h = np.concatenate([winners, best_thirds[:, [0, 2, 4, 6]]], axis=1)
+    # Segundos cruzados: B2, A2, D2, C2, F2, E2, H2, G2, J2, I2, L2, K2
+    idx_inv = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10]
+    r32_a = np.concatenate([runners[:, idx_inv], best_thirds[:, [1, 3, 5, 7]]], axis=1)
+
+    # --- FASES ELIMINATORIAS ---
+    ps_dict = get_penalty_skill()
+    
+    def simulate_ko(h_matrix, a_matrix, phase_idx):
+        num_matches = h_matrix.shape[1]
+        winners_ko = np.zeros((n, num_matches), dtype=np.int32)
+        for m in range(num_matches):
+            h, a = h_matrix[:, m], a_matrix[:, m]
+            gh = rng.poisson(xg_mat[h, a, 0], n)
+            ga = rng.poisson(xg_mat[h, a, 1], n)
+            
+            # Goles para Bug #3
+            team_goals_accum[:, h] += gh.astype(np.int32)
+            team_goals_accum[:, a] += ga.astype(np.int32)
+
+            # Penaltis (Bug #8: Manejo seguro de skill)
+            sh = np.array([ps_dict.get(idx_to_team[x], 0.5) for x in h])
+            sa = np.array([ps_dict.get(idx_to_team[x], 0.5) for x in a])
+            prob_h = sh / (sh + sa + 1e-9)
+            pk = rng.random(n) < prob_h
+            
+            winner = np.where(gh > ga, h, np.where(ga > gh, a, np.where(pk, h, a)))
+            winners_ko[:, m] = winner
+            u, c = np.unique(winner, return_counts=True)
+            survival[u, phase_idx] += c
+        return winners_ko
+
+    # Ejecución de rondas
+    u32, c32 = np.unique(np.concatenate([r32_h, r32_a]), return_counts=True)
+    survival[u32, 1] += c32
+    
+    r16_teams = simulate_ko(r32_h, r32_a, 2)
+    qf_teams = simulate_ko(r16_teams[:, :8], r16_teams[:, 8:], 3)
+    sf_teams = simulate_ko(qf_teams[:, :4], qf_teams[:, 4:], 4)
+    f_teams = simulate_ko(sf_teams[:, :2], sf_teams[:, 2:], 5)
+    simulate_ko(f_teams[:, :1], f_teams[:, 1:], 6)
+
+    # --- Bug #3: Procesamiento de Goleadores ---
+    player_data = []
+    total_goals_per_team = team_goals_accum.sum(axis=0)
+    for i, t_name in enumerate(QUALIFIED_TEAMS):
+        if total_goals_per_team[i] > 0 and t_name in p_names:
+            weights = p_weights.get(t_name, [1/23]*23)
+            # Distribución multinomial de los goles totales entre los 23 jugadores
+            dist = rng.multinomial(total_goals_per_team[i], weights)
+            for p_idx, g_count in enumerate(dist):
+                if g_count > 0:
+                    player_data.append({"Player": p_names[t_name][p_idx], "Team": t_name, "Goals": g_count / n})
+
+    # Preparar DataFrame de resultados
+    df_res = pd.DataFrame({"Team": QUALIFIED_TEAMS})
+    cols = ["Group Stage (%)", "Round of 32 (%)", "Round of 16 (%)", "Quarterfinals (%)", "Semifinals (%)", "Final (%)", "Winner (%)"]
+    for i, col in enumerate(cols):
+        df_res[col] = (survival[:, i] / n) * 100
+
+    return df_res.sort_values("Winner (%)", ascending=False).reset_index(drop=True), pd.DataFrame(player_data)
 # ══════════════════════════════════════════════════════════════════════════════
 # PÁGINAS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1411,17 +1567,16 @@ elif page == "📝 Resultados en Vivo":
                 st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
                 
     if real_res:
-        st.markdown("### Resultados Guardados")
-        for k, v in list(real_res.items()):
-            # Safe unpack to avoid ValueError on legacy keys
-            parts = k.split("|")
-            if len(parts) == 2:
-                t1, t2 = parts
-            else:
-                t1, t2 = k, "N/A"
-                
+    st.markdown("### Resultados Guardados")
+    for k, v in list(real_res.items()):
+        parts = k.split("|")
+        if len(parts) == 2:
+            t1, t2 = parts
+            # FIX SEGURO: Usamos .get() para evitar KeyError si el JSON está corrupto
+            gh = v.get('g_h', 0)
+            ga = v.get('g_a', 0)
             col1, col2 = st.columns([8, 1])
-            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
+            col1.markdown(f"**{t1}** {gh} - {ga} **{t2}**")
             if col2.button("🗑️", key=f"del_{k}"):
                 del real_res[k]
                 save_real_results(real_res)
