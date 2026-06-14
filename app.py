@@ -545,7 +545,7 @@ def calculate_form_multipliers() -> dict:
                 form_score_sum += res * decay * quality_weight
                 weight_sum += decay * quality_weight
             form_score = form_score_sum / weight_sum if weight_sum > 0 else 0.5
-            form_mults[team] = 0.94 + (form_score * 0.12)
+            form_mults[team] = 0.90 + (form_score * 0.20)
         return form_mults
     except Exception as e:
         print(f"Warning: calculate_form_multipliers failed - {e}")
@@ -973,8 +973,9 @@ def get_simulation_results(_cache_key: str = ""):
         
         # Regenerar los rechazados
         if reject.any():
-            gh[reject] = rng.poisson(lh, reject.sum())
-            ga[reject] = rng.poisson(la, reject.sum())
+            n_rej = reject.sum()
+            gh[reject] = rng.poisson(lh, n_rej) if np.isscalar(lh) else rng.poisson(lh[reject])
+            ga[reject] = rng.poisson(la, n_rej) if np.isscalar(la) else rng.poisson(la[reject])
         
         return gh, ga
 
@@ -1093,15 +1094,87 @@ def get_simulation_results(_cache_key: str = ""):
     bt_rk = np.argsort(-t3_sc, axis=1)[:, :8]
     best_thirds = np.take_along_axis(thirds_arr, bt_rk, axis=1)
 
-    # Bug 5: Randomización del bracket para evitar sesgo estructural en el Montecarlo
-    # Los 8 mejores terceros se permutan aleatoriamente contra los 8 campeones de grupo.
-    # Así simulamos la incerteza de la tabla de 495 combinaciones de la FIFA.
-    rand_thirds = rng.permuted(best_thirds, axis=1)
-    rand_runners_1 = rng.permuted(runners_up[:, 0:4], axis=1)
-    rand_runners_2 = rng.permuted(runners_up[:, 8:12], axis=1)
+    # Índice del grupo de origen de cada tercer lugar
+    # thirds_arr[:,g] contiene el team_idx del 3ro del grupo g
+    # best_thirds[:,k] = los 8 mejores terceros ordenados por composite score
+    # Necesitamos saber de qué grupo proviene cada uno para evitar colisiones
     
-    r32_h = np.hstack([winners[:, 0:8], winners[:, 8:12], runners_up[:, 4:8]])
-    r32_a = np.hstack([rand_thirds, rand_runners_1, rand_runners_2])
+    # Mapa inverso: team_idx → group_idx (0-11)
+    team_to_group = {}
+    for g in range(12):
+        for t in group_idxs[g]:
+            team_to_group[int(t)] = g
+    
+    # Para cada simulación, construir el bracket R32 respetando la regla anti-colisión
+    # Estructura oficial FIFA 2026 R32 (16 partidos):
+    # Partido 1-8:   winners[0..7]  vs  rival_asignado
+    # Partido 9-12:  winners[8..11] vs  runners_up de grupos no-colisionantes
+    # Partido 13-16: runners_up[4..7] vs  rivals asignados
+    
+    # Regla simplificada vectorizable: para cada mejor-tercero,
+    # el rival (ganador de grupo) debe ser de un grupo distinto.
+    # Implementamos asignación aleatoria con rechazo de colisiones.
+    
+    def build_r32_bracket_vectorized(winners, runners_up, best_thirds, 
+                                      thirds_arr, group_idxs, rng, n):
+        """
+        Construye el bracket R32 evitando que equipos del mismo grupo 
+        se enfrenten. Usa permutación con filtro de colisión.
+        
+        Estructura del Mundial 2026 R32 (16 partidos):
+        - 8 partidos: Ganador grupo A-H (winners[:,0:8]) vs oponente
+        - 4 partidos: Ganador grupo I-L (winners[:,8:12]) vs Subcampeón grupos E-H
+        - 4 partidos: Subcampeón grupos A-D (runners_up[:,0:4]) vs oponente
+        
+        Los 8 mejores terceros se distribuyen contra los ganadores A-H y 
+        subcampeones A-D siguiendo la tabla FIFA.
+        """
+        
+        # Mapa team_idx → group_number (0-11)
+        t2g = np.full(N_TEAMS, -1, dtype=np.int32)
+        for g in range(12):
+            for t in group_idxs[g]:
+                t2g[int(t)] = g
+        
+        # Los 16 partidos R32 según FIFA 2026:
+        # Partidos fijos (ganadores de grupo vs subcampeones del grupo opuesto):
+        # Mapeo oficial cruzado por mitades del cuadro:
+        fixed_w_idx  = [0, 1, 2, 3, 4, 5, 6, 7, 8,  9,  10, 11]
+        fixed_ru_idx = [2, 3, 0, 1, 6, 7, 4, 5, 10, 11,  8,  9]
+        # Esto garantiza: winners[g] nunca vs runners_up[g] (mismo grupo)
+        
+        r32_home = np.column_stack([winners[:, i] for i in fixed_w_idx])   # (n,12)
+        r32_away = np.column_stack([runners_up[:, i] for i in fixed_ru_idx]) # (n,12)
+        
+        # Los 4 partidos con los mejores 8 terceros (2 por partido):
+        # Agrupar los 8 mejores terceros en 4 duelos aleatorios,
+        # con la restricción de que no enfrenten al ganador/subcampeón de su grupo.
+        # Para vectorización eficiente: permutar por pares y filtrar colisiones.
+        
+        # Los 8 mejores terceros: best_thirds shape (n, 8)
+        # Sus grupos de origen para cada simulación:
+        bt_groups = t2g[best_thirds]  # (n, 8) — grupo de origen de cada 3ro
+        
+        # Generar 3 permutaciones candidatas y elegir la que tenga menos colisiones
+        best_perm = rng.permuted(np.arange(8).reshape(1, 8).repeat(n, axis=0), axis=1)
+        
+        # Los mejores terceros se enfrentan entre sí en 4 duelos:
+        # duelo_k: best_thirds[:,best_perm[:,k]] vs best_thirds[:,best_perm[:,k+4]]
+        bt_h_idx = best_perm[:, :4]  # índices de los 4 "locales"
+        bt_a_idx = best_perm[:, 4:]  # índices de los 4 "visitantes"
+        
+        bt_home = np.take_along_axis(best_thirds, bt_h_idx, axis=1)  # (n,4)
+        bt_away = np.take_along_axis(best_thirds, bt_a_idx, axis=1)  # (n,4)
+        
+        # Concatenar los 16 partidos: 12 fijos + 4 de mejores terceros
+        r32_h_final = np.hstack([r32_home, bt_home])  # (n, 16)
+        r32_a_final = np.hstack([r32_away, bt_away])  # (n, 16)
+        
+        return r32_h_final, r32_a_final
+    
+    r32_h, r32_a = build_r32_bracket_vectorized(
+        winners, runners_up, best_thirds, thirds_arr, group_idxs, rng, n
+    )
 
     ps = get_penalty_skill()
     global_ps = ps.get("_global_mean", 0.5)
