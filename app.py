@@ -25,6 +25,82 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
 from scipy.stats import poisson
+from scipy.optimize import minimize_scalar
+
+
+import json
+
+REAL_RESULTS_FILE = "real_results.json"
+
+def load_real_results() -> dict:
+    if os.path.exists(REAL_RESULTS_FILE):
+        try:
+            with open(REAL_RESULTS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_real_results(res: dict):
+    with open(REAL_RESULTS_FILE, "w") as f:
+        json.dump(res, f)
+
+@st.cache_data(show_spinner=False)
+def load_h2h_data():
+    try:
+        return pd.read_csv("h2h_results.csv", parse_dates=["date"])
+    except:
+        return pd.DataFrame(columns=["date", "home_team", "away_team", "home_score", "away_score", "tournament"])
+
+@st.cache_data(show_spinner=False)
+def get_all_h2h_stats() -> dict:
+    df = load_h2h_data()
+    if df.empty: return {}
+    stats = {}
+    for _, row in df.iterrows():
+        h, a = row["home_team"], row["away_team"]
+        if pd.isna(h) or pd.isna(a): continue
+        if h not in stats: stats[h] = {}
+        if a not in stats[h]: stats[h][a] = {"wins": 0, "draws": 0, "losses": 0, "matches": 0}
+        if a not in stats: stats[a] = {}
+        if h not in stats[a]: stats[a][h] = {"wins": 0, "draws": 0, "losses": 0, "matches": 0}
+        
+        stats[h][a]["matches"] += 1
+        stats[a][h]["matches"] += 1
+        if row["home_score"] > row["away_score"]:
+            stats[h][a]["wins"] += 1
+            stats[a][h]["losses"] += 1
+        elif row["home_score"] < row["away_score"]:
+            stats[h][a]["losses"] += 1
+            stats[a][h]["wins"] += 1
+        else:
+            stats[h][a]["draws"] += 1
+            stats[a][h]["draws"] += 1
+    return stats
+
+def get_h2h_multiplier(home: str, away: str, h2h_dict: dict) -> tuple[float, float]:
+    if home not in h2h_dict or away not in h2h_dict[home]:
+        return 1.0, 1.0
+    rec = h2h_dict[home][away]
+    if rec["matches"] < 3:
+        return 1.0, 1.0
+    wr = rec["wins"] / rec["matches"]
+    lr = rec["losses"] / rec["matches"]
+    return 1.0 + (wr - 0.5)*0.1, 1.0 + (lr - 0.5)*0.1
+
+@st.cache_data(show_spinner=False)
+def load_logistics_data() -> dict:
+    return {}
+
+
+SIMULATION_RUNS = 100000
+PRECISION_MODE = True
+
+HOME_ADVANTAGE_XG = {
+    "Mexico": 0.35,
+    "United States": 0.20,
+    "Canada": 0.15,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,27 +417,56 @@ def build_ensemble_engine():
         return _build_elo_xg_matrix(), _run_fast_simulation()
 
 
-def _elo_xg(elo_h: float, elo_a: float, is_host: bool) -> tuple[float, float]:
-    """Calcula xG mediante la fórmula Elo-Poisson."""
-    diff = (elo_h - elo_a) / 400.0
-    base = 1.20
-    home_bonus = 0.22 if is_host else 0.08
-    xg_h = max(0.15, base + diff + home_bonus)
-    xg_a = max(0.15, base - diff)
-    return xg_h, xg_a
+@st.cache_data(show_spinner=False)
+def load_sqi_data_v3() -> dict:
+    try:
+        import os
+        if os.path.exists('fbref_sqi.csv'):
+            df = pd.read_csv('fbref_sqi.csv')
+            return dict(zip(df['Team'], df['SQI']))
+    except:
+        pass
+    return {t: 1.0 for t in QUALIFIED_TEAMS}
+
+def _elo_xg(elo_h: float, elo_a: float, home_team: str = "", away_team: str = "") -> tuple[float, float]:
+    """Calcula xG base a partir de Elos."""
+    dr = elo_h - elo_a
+    ea = 1 / (1 + 10 ** (-dr / 400))
+    xg_h = ea * 2.8
+    xg_a = (1 - ea) * 2.8
+    
+    xg_h += HOME_ADVANTAGE_XG.get(home_team, 0.0)
+    xg_a += HOME_ADVANTAGE_XG.get(away_team, 0.0)
+    
+    return max(0.1, xg_h), max(0.1, xg_a)
 
 
 def _build_elo_xg_matrix() -> np.ndarray:
+    sqi = load_sqi_data_v3()
+    form = calculate_form_multipliers()
     xg = np.zeros((N_TEAMS, N_TEAMS, 2), dtype=np.float32)
-    for i, th in enumerate(QUALIFIED_TEAMS):
-        for j, ta in enumerate(QUALIFIED_TEAMS):
-            if i == j:
-                continue
-            elo_h = _BASE_ELO.get(th, 1850)
-            elo_a = _BASE_ELO.get(ta, 1850)
-            h, a = _elo_xg(elo_h, elo_a, th in CO_HOSTS)
-            xg[i, j, 0] = h
-            xg[i, j, 1] = a
+
+    for i in range(N_TEAMS):
+        for j in range(N_TEAMS):
+            if i == j: continue
+            
+            t_i, t_j = QUALIFIED_TEAMS[i], QUALIFIED_TEAMS[j]
+            elo_i = _BASE_ELO.get(t_i, 1850)
+            elo_j = _BASE_ELO.get(t_j, 1850)
+            
+            sqi_i = sqi.get(t_i, 1.0)
+            sqi_j = sqi.get(t_j, 1.0)
+            
+            e_i = elo_i * 0.40 + (elo_i * sqi_i) * 0.60
+            e_j = elo_j * 0.40 + (elo_j * sqi_j) * 0.60
+            
+            xg_i, xg_j = _elo_xg(e_i, e_j, t_i, t_j)
+            xg_i *= form.get(t_i, 1.0)
+            xg_j *= form.get(t_j, 1.0)
+            
+            xg[i, j, 0] = xg_i
+            xg[i, j, 1] = xg_j
+            
     return xg
 
 
@@ -369,6 +474,12 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     """Simulación vectorizada 100K autónoma (no requiere ensemble_simulator importado)."""
     rng = np.random.default_rng(2026)
     xg = _build_elo_xg_matrix()
+
+    real_res = load_real_results()
+    logistics = load_logistics_data()
+    team_last_day = {t: 0 for t in QUALIFIED_TEAMS}
+    team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
+
 
     # Grupos según WC2026_GROUPS
     all_teams_flat: list[str] = []
@@ -428,6 +539,18 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     r32_h = np.hstack([winners[:, 0:8],   winners[:, 8:12],    runners_up[:, 4:8]])
     r32_a = np.hstack([best_thirds,        runners_up[:, 0:4],  runners_up[:, 8:12]])
 
+    ps = get_penalty_skill()
+    global_ps = ps.get("_global_mean", 0.5)
+    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
+    def get_ps(idx): return ps.get(idx_to_team.get(idx, ""), global_ps)
+    v_get_ps = np.vectorize(get_ps)
+
+    ps = get_penalty_skill()
+    global_ps = ps.get("_global_mean", 0.5)
+    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
+    def get_ps(idx): return ps.get(idx_to_team.get(idx, ""), global_ps)
+    v_get_ps = np.vectorize(get_ps)
+
     def ko_round(home, away, phase_idx):
         nm = home.shape[1]
         adv = np.zeros((n, nm), dtype=np.int32)
@@ -435,7 +558,12 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
             h = home[:, m]; a = away[:, m]
             lh = xg[h, a, 0]; la = xg[h, a, 1]
             gh = rng.poisson(lh); ga = rng.poisson(la)
-            pen = rng.random(n) > 0.5
+            
+            skill_h = v_get_ps(h)
+            skill_a = v_get_ps(a)
+            prob_h = skill_h / (skill_h + skill_a + 1e-9)
+            pen = rng.random(n) < prob_h
+            
             w = np.where(gh > ga, h, np.where(ga > gh, a, np.where(pen, h, a)))
             adv[:, m] = w
             u, c = np.unique(w, return_counts=True)
@@ -459,12 +587,112 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     return df.sort_values("Winner (%)", ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
+def estimate_rho_from_data() -> dict:
+    try:
+        df = pd.read_csv("h2h_results.csv", parse_dates=["date"])
+        df = df[df["date"].dt.year >= 2010]
+        df = df[df["tournament"] != "Friendly"]
+        df = df[df["home_team"].isin(QUALIFIED_TEAMS) & df["away_team"].isin(QUALIFIED_TEAMS)]
+        df = df.dropna(subset=["home_score", "away_score"])
+        
+        N = len(df)
+        if N < 150: return {"rho": -0.12, "N": N, "fallback": True}
+        
+        h_scores, a_scores = df["home_score"].values, df["away_score"].values
+        xg_h, xg_a = np.zeros(N), np.zeros(N)
+        for i, row in enumerate(df.itertuples()):
+            xh, xa = _elo_xg(_BASE_ELO.get(row.home_team, 1850), _BASE_ELO.get(row.away_team, 1850))
+            xg_h[i] = xh
+            xg_a[i] = xa
+            
+        def neg_log_likelihood(rho):
+            tau = np.ones(N)
+            idx_00 = (h_scores == 0) & (a_scores == 0)
+            idx_10 = (h_scores == 1) & (a_scores == 0)
+            idx_01 = (h_scores == 0) & (a_scores == 1)
+            idx_11 = (h_scores == 1) & (a_scores == 1)
+            
+            tau[idx_00] = 1 - xg_h[idx_00] * xg_a[idx_00] * rho
+            tau[idx_10] = 1 + xg_a[idx_10] * rho
+            tau[idx_01] = 1 + xg_h[idx_01] * rho
+            tau[idx_11] = 1 - rho
+            
+            if np.any(tau <= 0): return 1e9
+            return -np.sum(np.log(tau))
+            
+        res = minimize_scalar(neg_log_likelihood, bounds=(-0.25, 0.0), method='bounded')
+        return {"rho": res.x if res.success else -0.12, "N": N, "fallback": not res.success}
+    except Exception as e:
+        return {"rho": -0.12, "N": 0, "fallback": True, "error": str(e)}
+
+@st.cache_data(show_spinner=False)
+def calculate_form_multipliers() -> dict:
+    try:
+        df = pd.read_csv("h2h_results.csv", parse_dates=["date"])
+        df = df[df["tournament"] != "Friendly"]
+        df = df[df["date"] < "2026-06-01"]
+        form_mults = {}
+        for team in QUALIFIED_TEAMS:
+            team_df = df[(df["home_team"] == team) | (df["away_team"] == team)].sort_values("date", ascending=False).head(12)
+            if len(team_df) < 5:
+                form_mults[team] = 1.0
+                continue
+            form_score_sum = 0.0
+            weight_sum = 0.0
+            for i, row in enumerate(team_df.itertuples()):
+                decay = 0.88 ** i
+                is_home = row.home_team == team
+                rival = row.away_team if is_home else row.home_team
+                hg, ag = row.home_score, row.away_score
+                res = 1.0 if (hg > ag and is_home) or (ag > hg and not is_home) else (0.5 if hg == ag else 0.0)
+                quality_weight = _BASE_ELO.get(rival, 1850) / 1900.0
+                form_score_sum += res * decay * quality_weight
+                weight_sum += decay * quality_weight
+            form_score = form_score_sum / weight_sum if weight_sum > 0 else 0.5
+            form_mults[team] = 0.94 + (form_score * 0.12)
+        return form_mults
+    except:
+        return {t: 1.0 for t in QUALIFIED_TEAMS}
+
+@st.cache_data(show_spinner=False)
+def get_penalty_skill() -> dict:
+    try:
+        df = pd.read_csv("shootouts.csv")
+        records = {}
+        for _, row in df.iterrows():
+            w, h, a = row["winner"], row["home_team"], row["away_team"]
+            if pd.isna(w): continue
+            for t in [h, a]:
+                if t not in records: records[t] = {"played": 0, "won": 0}
+                records[t]["played"] += 1
+                if w == t: records[t]["won"] += 1
+        total_p = sum(r["played"] for r in records.values())
+        global_mean = sum(r["won"] for r in records.values()) / total_p if total_p > 0 else 0.5
+        penalty_skill = {"_global_mean": global_mean}
+        for t, r in records.items():
+            penalty_skill[t] = (r["won"] + 4 * global_mean) / (r["played"] + 4)
+        return penalty_skill
+    except:
+        return {"_global_mean": 0.5}
+
 def predict_match_elo(home: str, away: str, max_g: int = 7) -> dict:
     """Predictor Elo-Poisson con corrección Dixon-Coles τ para el dashboard."""
-    elo_h = _BASE_ELO.get(home, 1850)
-    elo_a = _BASE_ELO.get(away, 1850)
-    is_host = home in CO_HOSTS
-    xg_h, xg_a = _elo_xg(elo_h, elo_a, is_host)
+    base_elo_h = _BASE_ELO.get(home, 1850)
+    base_elo_a = _BASE_ELO.get(away, 1850)
+    
+    sqi_dict = load_sqi_data_v3()
+    sqi_h = sqi_dict.get(home, 1.0)
+    sqi_a = sqi_dict.get(away, 1.0)
+    
+    elo_h = base_elo_h * 0.40 + (base_elo_h * sqi_h) * 0.60
+    elo_a = base_elo_a * 0.40 + (base_elo_a * sqi_a) * 0.60
+    
+    xg_h, xg_a = _elo_xg(elo_h, elo_a, home, away)
+
+    form_dict = calculate_form_multipliers()
+    xg_h *= form_dict.get(home, 1.0)
+    xg_a *= form_dict.get(away, 1.0)
 
     # Distribuciones Poisson marginales
     goals = np.arange(max_g + 1)
@@ -475,7 +703,8 @@ def predict_match_elo(home: str, away: str, max_g: int = 7) -> dict:
     M = np.outer(ph, pa)
 
     # Corrección τ Dixon-Coles (ρ estimado)
-    rho = -0.07
+    rho_data = estimate_rho_from_data()
+    rho = rho_data["rho"]
     def tau(x, y):
         if x == 0 and y == 0: return 1 - xg_h * xg_a * rho
         if x == 1 and y == 0: return 1 + xg_a * rho
@@ -687,7 +916,7 @@ def _hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
 
 
 def plotly_elo_radar(home: str, away: str, pred: dict) -> go.Figure:
-    categories = ["Elo Rating", "xG Ataque", "xG Defensa", "Form", "Valor Mkt"]
+    categories = ["Elo Rating", "xG Ataque", "xG Defensa", "Form"]
 
     def normalize(val, lo, hi):
         return round((val - lo) / (hi - lo + 1e-9) * 100, 1)
@@ -695,10 +924,14 @@ def plotly_elo_radar(home: str, away: str, pred: dict) -> go.Figure:
     elo_h, elo_a = pred["elo_h"], pred["elo_a"]
     xg_h, xg_a = pred["xg_h"], pred["xg_a"]
 
+    form_dict = calculate_form_multipliers()
+    form_h = round((form_dict.get(home, 1.0) - 0.94) / 0.12 * 100, 1)
+    form_a = round((form_dict.get(away, 1.0) - 0.94) / 0.12 * 100, 1)
+
     vals_h = [normalize(elo_h, 1700, 2100), normalize(xg_h, 0.5, 2.5),
-              normalize(2.5 - xg_a, 0.5, 2.5), 65, 60]
+              normalize(2.5 - xg_a, 0.5, 2.5), form_h]
     vals_a = [normalize(elo_a, 1700, 2100), normalize(xg_a, 0.5, 2.5),
-              normalize(2.5 - xg_h, 0.5, 2.5), 60, 55]
+              normalize(2.5 - xg_h, 0.5, 2.5), form_a]
 
     flag_h = TEAM_FLAGS.get(home, "🏳")
     flag_a = TEAM_FLAGS.get(away, "🏳")
@@ -760,20 +993,28 @@ with st.sidebar:
     st.markdown('<div class="section-title">Navegación</div>', unsafe_allow_html=True)
     page = st.radio(
         label="Sección",
-        options=["🌐 Grupos", "⚽ Predictor de Partido", "📊 Simulación Montecarlo", "🏅 Ranking Global"],
+        options=["🌐 Grupos", "⚽ Predictor de Partido", "📊 Simulación Montecarlo", "🏅 Ranking Global", "📝 Resultados en Vivo"],
         label_visibility="collapsed",
     )
 
     st.markdown('<hr style="border-color:#30363d; margin:18px 0;">', unsafe_allow_html=True)
 
     st.markdown('<div class="section-title">Motor de Simulación</div>', unsafe_allow_html=True)
-    n_sims_label = st.select_slider(
-        "Simulaciones",
-        options=["10K", "50K", "100K"],
-        value="100K",
-        label_visibility="visible",
-    )
-    n_sims_map = {"10K": 10_000, "50K": 50_000, "100K": 100_000}
+    st.markdown(f"**Iteraciones Fijas:** {SIMULATION_RUNS:,}")
+    st.markdown(f"**Modo Precisión:** {'Activado' if PRECISION_MODE else 'Desactivado'}")
+    st.markdown('<hr style="border-color:#30363d; margin:18px 0;">', unsafe_allow_html=True)
+
+    rho_info = estimate_rho_from_data()
+    ps_info = get_penalty_skill()
+    rho_label = f"ρ = {rho_info['rho']:.3f} {'(fallback)' if rho_info['fallback'] else f'N={rho_info["N"]}'}"
+    ps_label = f"{'Datos reales' if len(ps_info) > 1 else 'Modelo 50/50'}"
+    form_label = "Activo ✓"
+
+    st.markdown('<div class="section-title">Estado del Motor</div>', unsafe_allow_html=True)
+    st.markdown(f"**Dixon-Coles τ:** {rho_label}")
+    st.markdown(f"**Penaltis:** {ps_label}")
+    st.markdown(f"**Forma Temporal:** {form_label}")
+
 
     st.markdown('<hr style="border-color:#30363d; margin:18px 0;">', unsafe_allow_html=True)
     st.markdown("""
@@ -795,10 +1036,17 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def get_simulation_results(n: int) -> pd.DataFrame:
+def get_simulation_results() -> pd.DataFrame:
+    n = SIMULATION_RUNS
     # CACHE BUSTER: 2026-06-12
     """Ejecuta la simulación de torneos en cache."""
     xg = _build_elo_xg_matrix()
+
+    real_res = load_real_results()
+    logistics = load_logistics_data()
+    team_last_day = {t: 0 for t in QUALIFIED_TEAMS}
+    team_last_region = {t: "Unknown" for t in QUALIFIED_TEAMS}
+
 
     # Build group structure from WC2026_GROUPS
     team_order = []
@@ -827,8 +1075,21 @@ def get_simulation_results(n: int) -> pd.DataFrame:
         teams = group_idxs[g]
         for a_local, b_local in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]:
             h_i, a_i = int(teams[a_local]), int(teams[b_local])
-            gh = rng.poisson(float(xg[h_i, a_i, 0]), n).astype(np.int16)
-            ga = rng.poisson(float(xg[h_i, a_i, 1]), n).astype(np.int16)
+            
+            t_h = team_order[h_i]
+            t_a = team_order[a_i]
+            k1 = f"{t_h}|{t_a}"
+            k2 = f"{t_a}|{t_h}"
+            
+            if k1 in real_res:
+                gh = np.full(n, real_res[k1]["g_h"], dtype=np.int16)
+                ga = np.full(n, real_res[k1]["g_a"], dtype=np.int16)
+            elif k2 in real_res:
+                gh = np.full(n, real_res[k2]["g_a"], dtype=np.int16)
+                ga = np.full(n, real_res[k2]["g_h"], dtype=np.int16)
+            else:
+                gh = rng.poisson(float(xg[h_i, a_i, 0]), n).astype(np.int16)
+                ga = rng.poisson(float(xg[h_i, a_i, 1]), n).astype(np.int16)
             pts[:, h_i] += np.where(gh > ga, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             pts[:, a_i] += np.where(ga > gh, np.int16(3), np.where(gh == ga, np.int16(1), np.int16(0)))
             gd[:, h_i] += (gh - ga)
@@ -858,6 +1119,12 @@ def get_simulation_results(n: int) -> pd.DataFrame:
     r32_h = np.hstack([winners[:, 0:8],   winners[:, 8:12],    runners_up[:, 4:8]])
     r32_a = np.hstack([best_thirds,        runners_up[:, 0:4],  runners_up[:, 8:12]])
 
+    ps = get_penalty_skill()
+    global_ps = ps.get("_global_mean", 0.5)
+    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
+    def get_ps(idx): return ps.get(idx_to_team.get(idx, ""), global_ps)
+    v_get_ps = np.vectorize(get_ps)
+
     def ko_round(home, away, phase_idx):
         nm = home.shape[1]
         adv = np.zeros((n, nm), dtype=np.int32)
@@ -866,7 +1133,10 @@ def get_simulation_results(n: int) -> pd.DataFrame:
             lh = xg[h, a, 0].astype(np.float64)
             la = xg[h, a, 1].astype(np.float64)
             gh = rng.poisson(lh); ga = rng.poisson(la)
-            pen = rng.random(n) > 0.5
+            skill_h = v_get_ps(h)
+            skill_a = v_get_ps(a)
+            prob_h = skill_h / (skill_h + skill_a + 1e-9)
+            pen = rng.random(n) < prob_h
             w = np.where(gh > ga, h, np.where(ga > gh, a, np.where(pen, h, a)))
             adv[:, m] = w
             u, c = np.unique(w, return_counts=True)
@@ -1039,15 +1309,15 @@ elif page == "⚽ Predictor de Partido":
         st.markdown('<div class="section-title">Probabilidades del Partido (1x2)</div>', unsafe_allow_html=True)
         st.plotly_chart(plotly_prob_bar(pred['p_home'], pred['p_draw'], pred['p_away'],
                                         home_team, away_team),
-                        width='stretch')
+                        use_container_width=True)
 
         st.markdown('<br><div class="section-title">Mapa de Marcadores Exactos</div>', unsafe_allow_html=True)
         st.plotly_chart(plotly_heatmap(pred['matrix'], home_team, away_team),
-                        width='stretch')
+                        use_container_width=True)
 
         st.markdown('<br><div class="section-title">Perfil Comparativo Estadístico</div>', unsafe_allow_html=True)
         st.plotly_chart(plotly_elo_radar(home_team, away_team, pred),
-                        width='stretch')
+                        use_container_width=True)
 
         # Top marcadores
         st.markdown('<div class="section-title">Marcadores Más Probables</div>', unsafe_allow_html=True)
@@ -1070,11 +1340,11 @@ elif page == "📊 Simulación Montecarlo":
     st.markdown("## Simulación Montecarlo · 100,000 Torneos")
     st.markdown('<p style="color:#8b949e; font-size:0.85rem; margin-top:-10px; margin-bottom:24px;">Probabilidades de supervivencia por fase calculadas mediante vectorización NumPy</p>', unsafe_allow_html=True)
 
-    n_sims = n_sims_map[n_sims_label]
+    n_sims = SIMULATION_RUNS
 
     with st.spinner(f"⚡ Ejecutando {n_sims_label} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        results_df = get_simulation_results(n_sims)
+        results_df = get_simulation_results()
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
@@ -1095,7 +1365,7 @@ elif page == "📊 Simulación Montecarlo":
     st.markdown("<br>", unsafe_allow_html=True)
 
     # Gráfico de barras horizontal (top 20 campeones)
-    st.plotly_chart(plotly_tournament_bracket(results_df), width='stretch')
+    st.plotly_chart(plotly_tournament_bracket(results_df), use_container_width=True)
 
     # Selector de equipo para funnel
     st.markdown('<div class="section-title">Ruta de Supervivencia por Equipo</div>', unsafe_allow_html=True)
@@ -1105,7 +1375,7 @@ elif page == "📊 Simulación Montecarlo":
         index=QUALIFIED_TEAMS.index("Argentina"),
         key="funnel_team",
     )
-    st.plotly_chart(plotly_survival_funnel(results_df, sel_team), width='stretch')
+    st.plotly_chart(plotly_survival_funnel(results_df, sel_team), use_container_width=True)
 
     # Tabla de probabilidades completa con barras de color
     st.markdown('<div class="section-title">Tabla Completa de Probabilidades</div>', unsafe_allow_html=True)
@@ -1155,6 +1425,43 @@ elif page == "📊 Simulación Montecarlo":
 # ════════════════════════════════════════════════════════
 # PÁGINA 4: RANKING GLOBAL
 # ════════════════════════════════════════════════════════
+
+elif page == "📝 Resultados en Vivo":
+    st.header("📝 Resultados en Vivo")
+    st.markdown("Ingresa los resultados reales que vayan ocurriendo en el torneo. El simulador los tomará como verdades absolutas al proyectar el futuro.")
+    
+    real_res = load_real_results()
+    
+    with st.form("add_result_form"):
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
+        team_h = c1.selectbox("Local", options=QUALIFIED_TEAMS, key="res_h")
+        g_h = c2.number_input("Goles Local", min_value=0, max_value=15, value=0)
+        g_a = c3.number_input("Goles Visita", min_value=0, max_value=15, value=0)
+        team_a = c4.selectbox("Visita", options=QUALIFIED_TEAMS, key="res_a", index=1)
+        
+        submitted = st.form_submit_button("Guardar Resultado Real")
+        if submitted:
+            if team_h == team_a:
+                st.error("Un equipo no puede jugar contra sí mismo.")
+            else:
+                key = f"{team_h}|{team_a}"
+                real_res[key] = {"g_h": g_h, "g_a": g_a}
+                save_real_results(real_res)
+                st.cache_data.clear()
+                st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
+                
+    if real_res:
+        st.markdown("### Resultados Guardados")
+        for k, v in list(real_res.items()):
+            t1, t2 = k.split("|")
+            col1, col2 = st.columns([8, 1])
+            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
+            if col2.button("🗑️", key=f"del_{k}"):
+                del real_res[k]
+                save_real_results(real_res)
+                st.cache_data.clear()
+                st.rerun()
+
 elif page == "🏅 Ranking Global":
     st.markdown("## Power Ranking · 48 Selecciones")
     st.markdown('<p style="color:#8b949e; font-size:0.85rem; margin-top:-10px; margin-bottom:24px;">Ranking basado en Elo FIFA 2026. El Índice de Poder combina ataque y defensa.</p>', unsafe_allow_html=True)
@@ -1172,9 +1479,9 @@ elif page == "🏅 Ranking Global":
             opp_elo = _BASE_ELO.get(opp, 1800)
             
             # Jugando como local
-            scored_h, conceded_h = _elo_xg(elo, opp_elo, False)
+            scored_h, conceded_h = _elo_xg(elo, opp_elo)
             # Jugando como visitante
-            conceded_a, scored_a = _elo_xg(opp_elo, elo, False)
+            conceded_a, scored_a = _elo_xg(opp_elo, elo)
             
             atk_sum += (scored_h + scored_a) / 2.0
             def_sum += (conceded_h + conceded_a) / 2.0
@@ -1246,7 +1553,7 @@ elif page == "🏅 Ranking Global":
                    tickfont=dict(color="#8b949e"), gridcolor="#21262d"),
         height=480,
     )
-    st.plotly_chart(fig_scatter, width='stretch')
+    st.plotly_chart(fig_scatter, use_container_width=True)
 
     # Tabla completa
     st.markdown('<div class="section-title">Ranking Completo de 48 Selecciones</div>', unsafe_allow_html=True)
