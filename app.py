@@ -465,9 +465,15 @@ def _build_elo_xg_matrix() -> np.ndarray:
             
             sqi_c = max(0.85, min(1.15, sqi_i))
             e_i = elo_i * 0.40 + (elo_i * sqi_c) * 0.60
-            e_j = elo_j * 0.40 + (elo_j * sqi_j) * 0.60
+            sqi_c_j = max(0.85, min(1.15, sqi_j))
+            e_j = elo_j * 0.40 + (elo_j * sqi_c_j) * 0.60
             
             xg_i, xg_j = _elo_xg(e_i, e_j, t_i, t_j)
+            
+            m_i, m_j = get_h2h_multiplier(t_i, t_j, h2h_dict)
+            xg_i *= m_i
+            xg_j *= m_j
+            
             xg_i *= form.get(t_i, 1.0)
             xg_j *= form.get(t_j, 1.0)
             
@@ -579,11 +585,6 @@ def _run_fast_simulation(n: int = 100_000) -> pd.DataFrame:
     def get_ps(idx): return ps.get(idx_to_team.get(idx, ""), global_ps)
     v_get_ps = np.vectorize(get_ps)
 
-    ps = get_penalty_skill()
-    global_ps = ps.get("_global_mean", 0.5)
-    idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
-    def get_ps(idx): return ps.get(idx_to_team.get(idx, ""), global_ps)
-    v_get_ps = np.vectorize(get_ps)
 
     def ko_round(home, away, phase_idx):
         nm = home.shape[1]
@@ -686,7 +687,8 @@ def calculate_form_multipliers() -> dict:
             form_score = form_score_sum / weight_sum if weight_sum > 0 else 0.5
             form_mults[team] = 0.94 + (form_score * 0.12)
         return form_mults
-    except:
+    except Exception as e:
+        print(f"Warning: calculate_form_multipliers failed - {e}")
         return {t: 1.0 for t in QUALIFIED_TEAMS}
 
 @st.cache_data(show_spinner=False)
@@ -1517,44 +1519,6 @@ elif page == "📊 Simulación Montecarlo":
 # PÁGINA 4: RANKING GLOBAL
 # ════════════════════════════════════════════════════════
 
-elif page == "📝 Resultados en Vivo":
-    st.header("📝 Resultados en Vivo")
-    st.markdown("Ingresa los resultados reales que vayan ocurriendo en el torneo. El simulador los tomará como verdades absolutas al proyectar el futuro.")
-    
-    real_res = load_real_results()
-    
-    with st.form("add_result_form"):
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
-        team_h = c1.selectbox("Local", options=QUALIFIED_TEAMS, key="res_h")
-        g_h = c2.number_input("Goles Local", min_value=0, max_value=15, value=0)
-        g_a = c3.number_input("Goles Visita", min_value=0, max_value=15, value=0)
-        team_a = c4.selectbox("Visita", options=QUALIFIED_TEAMS, key="res_a", index=1)
-        
-        submitted = st.form_submit_button("Guardar Resultado Real")
-        if submitted:
-            if team_h == team_a:
-                st.error("Un equipo no puede jugar contra sí mismo.")
-            else:
-                key = f"{team_h}|{team_a}"
-                real_res[key] = {"g_h": g_h, "g_a": g_a}
-                save_real_results(real_res)
-                st.cache_data.clear()
-                st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
-                
-    if real_res:
-        st.markdown("### Resultados Guardados")
-        for k, v in list(real_res.items()):
-            t1, t2 = k.split("|")
-            col1, col2 = st.columns([8, 1])
-            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
-            if col2.button("🗑️", key=f"del_{k}"):
-                del real_res[k]
-                save_real_results(real_res)
-                st.cache_data.clear()
-                st.rerun()
-
-
-
     st.markdown('<hr style="border-color:#30363d; margin:30px 0;">', unsafe_allow_html=True)
     st.markdown("### 🥇 Predicción de Goleadores (Botín de Oro / MVP)")
     st.markdown("Generado simulando individualmente las acciones de cada uno de los 1100 jugadores en los 6.4 millones de partidos del Montecarlo.")
@@ -1579,6 +1543,8 @@ elif page == "📝 Resultados en Vivo":
         st.plotly_chart(fig_scorers, use_container_width=True)
     else:
         st.info("Datos de jugadores no disponibles.")
+
+
 
 elif page == "🏅 Ranking Global":
     st.markdown("## Power Ranking · 48 Selecciones")
@@ -1691,6 +1657,42 @@ elif page == "🏅 Ranking Global":
         },
         height=520,
     )
+
+elif page == "📝 Resultados en Vivo":
+    st.header("📝 Resultados en Vivo")
+    st.markdown("Ingresa los resultados reales que vayan ocurriendo en el torneo. El simulador los tomará como verdades absolutas al proyectar el futuro.")
+    
+    real_res = load_real_results()
+    
+    with st.form("add_result_form"):
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
+        team_h = c1.selectbox("Local", options=QUALIFIED_TEAMS, key="res_h")
+        g_h = c2.number_input("Goles Local", min_value=0, max_value=15, value=0)
+        g_a = c3.number_input("Goles Visita", min_value=0, max_value=15, value=0)
+        team_a = c4.selectbox("Visita", options=QUALIFIED_TEAMS, key="res_a", index=1)
+        
+        submitted = st.form_submit_button("Guardar Resultado Real")
+        if submitted:
+            if team_h == team_a:
+                st.error("Un equipo no puede jugar contra sí mismo.")
+            else:
+                key = f"{team_h}|{team_a}"
+                real_res[key] = {"g_h": g_h, "g_a": g_a}
+                save_real_results(real_res)
+                st.cache_data.clear()
+                st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
+                
+    if real_res:
+        st.markdown("### Resultados Guardados")
+        for k, v in list(real_res.items()):
+            t1, t2 = k.split("|")
+            col1, col2 = st.columns([8, 1])
+            col1.markdown(f"**{t1}** {v['g_h']} - {v['g_a']} **{t2}**")
+            if col2.button("🗑️", key=f"del_{k}"):
+                del real_res[k]
+                save_real_results(real_res)
+                st.cache_data.clear()
+                st.rerun()
 
 
 # ── Footer ───────────────────────────────────────────────────────────────────
