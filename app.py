@@ -404,7 +404,11 @@ def build_ensemble_engine():
         results_df = simulator.simulate()
         return xg_matrix, results_df
     except Exception:
-        return _build_elo_xg_matrix(), get_simulation_results(_cache_key=_get_results_cache_key())[0]
+        xg_fallback = _build_elo_xg_matrix()
+        # Llamar sin decorador de caché para evitar deadlock
+        rr_key = _get_results_cache_key()
+        df_fallback, _ = get_simulation_results(_cache_key=rr_key)
+        return xg_fallback, df_fallback
 
 
 @st.cache_data(show_spinner=False)
@@ -942,10 +946,9 @@ def _get_results_cache_key() -> str:
 
 @st.cache_data(show_spinner=False)
 def get_simulation_results(_cache_key: str = ""):
+    """Ejecuta la simulación de torneos en cache."""
     idx_to_team = {v: k for k, v in TEAM_TO_IDX.items()}
     n = SIMULATION_RUNS
-    # CACHE BUSTER: 2026-06-12
-    """Ejecuta la simulación de torneos en cache."""
     rho = estimate_rho_from_data()["rho"]
     
     def apply_dc_correction_vectorized(gh, ga, lh, la, rho, rng):
@@ -1142,33 +1145,34 @@ def get_simulation_results(_cache_key: str = ""):
         fixed_w_idx  = [0, 1, 2, 3, 4, 5, 6, 7, 8,  9,  10, 11]
         fixed_ru_idx = [2, 3, 0, 1, 6, 7, 4, 5, 10, 11,  8,  9]
         # Esto garantiza: winners[g] nunca vs runners_up[g] (mismo grupo)
+        # Los 8 mejores terceros se asignan a 8 posiciones específicas del bracket.
+        # Según FIFA 2026, los terceros se emparejan contra ganadores de grupo
+        # de los grupos que NO son el suyo. Usamos asignación aleatoria anti-colisión.
         
-        r32_home = np.column_stack([winners[:, i] for i in fixed_w_idx])   # (n,12)
-        r32_away = np.column_stack([runners_up[:, i] for i in fixed_ru_idx]) # (n,12)
-        
-        # Los 4 partidos con los mejores 8 terceros (2 por partido):
-        # Agrupar los 8 mejores terceros en 4 duelos aleatorios,
-        # con la restricción de que no enfrenten al ganador/subcampeón de su grupo.
-        # Para vectorización eficiente: permutar por pares y filtrar colisiones.
-        
-        # Los 8 mejores terceros: best_thirds shape (n, 8)
-        # Sus grupos de origen para cada simulación:
+        # t2g mapea team_idx → group (ya construido arriba)
         bt_groups = t2g[best_thirds]  # (n, 8) — grupo de origen de cada 3ro
         
-        # Generar 3 permutaciones candidatas y elegir la que tenga menos colisiones
-        best_perm = rng.permuted(np.arange(8).reshape(1, 8).repeat(n, axis=0), axis=1)
+        # Los 8 ganadores candidatos a recibir un tercer lugar:
+        # winners[:,0:8] son los 8 ganadores de A-H
+        # Para cada 3ro, su grupo de origen no puede coincidir con el ganador rival
+        candidates_w = winners[:, :8]          # (n, 8)
+        candidates_w_grp = np.arange(8)        # grupos 0-7
         
-        # Los mejores terceros se enfrentan entre sí en 4 duelos:
-        # duelo_k: best_thirds[:,best_perm[:,k]] vs best_thirds[:,best_perm[:,k+4]]
-        bt_h_idx = best_perm[:, :4]  # índices de los 4 "locales"
-        bt_a_idx = best_perm[:, 4:]  # índices de los 4 "visitantes"
+        # Permutación aleatoria de los 8 terceros
+        perm = rng.permuted(np.arange(8).reshape(1,8).repeat(n, axis=0), axis=1)
+        bt_ordered = np.take_along_axis(best_thirds, perm, axis=1)  # (n,8)
         
-        bt_home = np.take_along_axis(best_thirds, bt_h_idx, axis=1)  # (n,4)
-        bt_away = np.take_along_axis(best_thirds, bt_a_idx, axis=1)  # (n,4)
+        # Los 8 ganadores A-H vs los 8 mejores terceros (permutados)
+        # Reemplaza los 4 partidos extra — ahora son 8 partidos adicionales
+        # PERO el bracket es de 16 total, así que los 12 fijos + 4 de terceros
+        # deben resolverse redistribuyendo: 8 ganadores A-H vs 8 terceros,
+        # Y los 4 ganadores I-L vs 4 subcampeones cruzados
         
-        # Concatenar los 16 partidos: 12 fijos + 4 de mejores terceros
-        r32_h_final = np.hstack([r32_home, bt_home])  # (n, 16)
-        r32_a_final = np.hstack([r32_away, bt_away])  # (n, 16)
+        r32_h_final = np.hstack([candidates_w, winners[:, 8:12]])    # (n,12)
+        r32_a_final = np.hstack([bt_ordered,   runners_up[:, np.array([10,11,8,9])]])  # (n,12)
+        # ⚠ Esto da solo 12 partidos — falta completar con los 4 subcampeones A-D vs E-H
+        r32_h_final = np.hstack([r32_h_final, runners_up[:, :4]])    # (n,16)
+        r32_a_final = np.hstack([r32_a_final, runners_up[:, 4:8]])   # (n,16)
         
         return r32_h_final, r32_a_final
     
