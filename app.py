@@ -1342,7 +1342,7 @@ elif page == "📊 Simulación Montecarlo":
 
     n_sims = SIMULATION_RUNS
 
-    with st.spinner(f"⚡ Ejecutando {n_sims_label} simulaciones vectorizadas..."):
+    with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
         results_df = get_simulation_results()
         elapsed = time.perf_counter() - t0
