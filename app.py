@@ -1694,6 +1694,7 @@ elif page == "📝 Resultados en Vivo":
                 real_res[key] = {"g_h": g_h, "g_a": g_a}
                 save_real_results(real_res)
                 st.success(f"Resultado guardado: {team_h} {g_h} - {g_a} {team_a}")
+                st.rerun()
                 
     if real_res:
         st.markdown("### Resultados Guardados")
