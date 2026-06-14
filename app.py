@@ -1435,7 +1435,7 @@ elif page == "📊 Simulación Montecarlo":
 
     with st.spinner(f"⚡ Ejecutando {n_sims:,} simulaciones vectorizadas..."):
         t0 = time.perf_counter()
-        results_df = get_simulation_results()
+        results_df, top_scorers_df = get_simulation_results()
         elapsed = time.perf_counter() - t0
 
     # KPIs de la simulación
